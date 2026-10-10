@@ -12,6 +12,61 @@ defmodule Lasso.RPC.MethodNotFoundRoutingTest do
   @read_method "eth_getBalance"
   @read_params ["0x0000000000000000000000000000000000000001", "latest"]
 
+  for outcome <- [:unsupported, :provider_failure, :quota_exhaustion] do
+    test "HTTP #{outcome} exhaustion preserves the serving owners and an independent route", %{
+      chain: chain
+    } do
+      control_chain = chain + 1_000_000_000
+
+      on_exit(fn ->
+        Lasso.ProfileChainSupervisor.stop_profile_chain(@profile, control_chain)
+        Lasso.Config.ConfigStore.unregister_chain_runtime(@profile, control_chain)
+        Lasso.Providers.Catalog.build_from_config()
+      end)
+
+      setup_providers([%{id: "control", behavior: healthy("control")}], chain: control_chain)
+
+      owners =
+        Map.new(
+          [
+            LassoWeb.Endpoint,
+            Lasso.Config.ConfigStore,
+            Lasso.Config.ConfigStore.Owner,
+            Lasso.Providers.Catalog.Owner,
+            Lasso.ProfileChainSupervisor,
+            Lasso.Core.Request.ByteBudget,
+            Lasso.Core.Transport.UpstreamAdmission
+          ],
+          fn owner ->
+            pid = Process.whereis(owner)
+            assert is_pid(pid)
+            {owner, pid}
+          end
+        )
+
+      assert_http_serving(control_chain, owners)
+
+      setup_providers([
+        %{id: "unsupported", behavior: unsupported("unsupported")},
+        %{id: "other", behavior: http_other(unquote(outcome))}
+      ])
+
+      assert %{"id" => 1, "error" => error} = http_read(chain)
+      assert upstream_calls("unsupported", @read_method) == 1
+      assert upstream_calls("other", @read_method) == 1
+
+      if unquote(outcome) == :unsupported do
+        assert %{"code" => @unsupported_code, "message" => message, "data" => data} = error
+        assert data["provider"] in ["unsupported", "other"]
+        assert message == "unsupported by #{data["provider"]}"
+      else
+        refute error["code"] == @unsupported_code
+      end
+
+      assert_http_serving(control_chain, owners)
+    end
+  end
+
   describe "replay-safe reads" do
     test "continue past an unsupported provider inside the dispatch budget", %{chain: chain} do
       setup_providers([
@@ -128,6 +183,25 @@ defmodule Lasso.RPC.MethodNotFoundRoutingTest do
   end
 
   describe "mixed outcomes" do
+    test "a rejection at the dispatch budget does not hide an earlier provider failure", %{
+      chain: chain
+    } do
+      setup_providers([
+        %{id: "failed", priority: 1, behavior: watched(failing(:provider_failure), "failed")},
+        %{id: "unsupported-2", priority: 2, behavior: unsupported("unsupported-2")},
+        %{id: "unsupported-3", priority: 3, behavior: unsupported("unsupported-3")},
+        %{id: "healthy", priority: 4, behavior: healthy("healthy")}
+      ])
+
+      assert {:error, %JError{category: :provider_error} = error, ctx} = read(chain)
+      refute error.code == @unsupported_code
+      assert ctx.execution_envelope.dispatch_count == 3
+      assert upstream_calls("failed", @read_method) == 1
+      assert upstream_calls("unsupported-2", @read_method) == 1
+      assert upstream_calls("unsupported-3", @read_method) == 1
+      assert upstream_calls("healthy", @read_method) == 0
+    end
+
     for kind <- [:provider_failure, :quota_exhaustion, :attempt_timeout] do
       test "unsupported then #{kind} is not reported as method-not-found", %{chain: chain} do
         assert_mixed_not_method_not_found(chain, unquote(kind), :unsupported_first)
@@ -192,6 +266,9 @@ defmodule Lasso.RPC.MethodNotFoundRoutingTest do
       provider_id
     )
   end
+
+  defp http_other(:unsupported), do: unsupported("other")
+  defp http_other(outcome), do: watched(failing(outcome), "other")
 
   defp healthy(provider_id),
     do: watched({:conditional, fn _, _, _ -> {:ok, "0x1"} end}, provider_id)
