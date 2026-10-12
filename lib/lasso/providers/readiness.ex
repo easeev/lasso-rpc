@@ -35,20 +35,32 @@ defmodule Lasso.Providers.Readiness do
   @doc "Reports eligible HTTP alternatives and whether they have fresh head evidence."
   @spec check_chain(String.t(), pos_integer()) :: map()
   def check_chain(profile, chain_id) do
+    catalog = Catalog.snapshot()
+
+    if current_catalog?(catalog) do
+      check = check_published_chain(profile, chain_id, catalog)
+      if current_catalog?(catalog), do: check, else: unavailable_chain(chain_id)
+    else
+      unavailable_chain(chain_id)
+    end
+  end
+
+  defp check_published_chain(profile, chain_id, catalog) do
     candidates =
-      with %{} = catalog <- Catalog.snapshot(),
-           {:ok, plan} <- Catalog.get_routing_plan(catalog, profile, chain_id) do
-        plan
-        |> CandidateListing.list_routing_candidates_from_plan(
-          SelectionFilters.new(
-            protocol: :http,
-            exclude_rate_limited: true,
-            include_half_open: true
+      case Catalog.get_routing_plan(catalog, profile, chain_id) do
+        {:ok, plan} ->
+          plan
+          |> CandidateListing.list_routing_candidates_from_plan(
+            SelectionFilters.new(
+              protocol: :http,
+              exclude_rate_limited: true,
+              include_half_open: true
+            )
           )
-        )
-        |> Enum.filter(&eligible_http_candidate?/1)
-      else
-        _unpublished -> []
+          |> Enum.filter(&eligible_http_candidate?/1)
+
+        _unpublished ->
+          []
       end
 
     reason =
@@ -73,6 +85,21 @@ defmodule Lasso.Providers.Readiness do
       chain_id: chain_id,
       status: status(reason),
       reason: reason
+    }
+  end
+
+  defp current_catalog?(%{generation: generation} = catalog) do
+    Catalog.snapshot() == catalog and generation == ConfigStore.route_generation()
+  end
+
+  defp current_catalog?(_unpublished), do: false
+
+  defp unavailable_chain(chain_id) do
+    %{
+      eligible_upstreams: 0,
+      chain_id: chain_id,
+      status: "not_ready",
+      reason: "no_eligible_upstream"
     }
   end
 

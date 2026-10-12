@@ -93,6 +93,55 @@ defmodule LassoWeb.ReadyEndpointIntegrationTest do
              build_conn() |> get("/api/ready?profile=public") |> json_response(503)
   end
 
+  test "readiness rejects a stale catalog until the current configuration is published",
+       %{chain: chain} do
+    setup_providers([%{id: "generation-upstream", profile: "public", behavior: :healthy}])
+    instance_id = Catalog.lookup_instance_id("public", chain, "generation-upstream")
+    :ok = BlockSyncRegistry.put_height(chain, instance_id, 100, :http)
+    scoped = "/api/ready?profile=public&chain=#{chain}"
+    owners = Enum.map([ConfigStore, Catalog.Owner], &Process.whereis/1)
+
+    assert %{"status" => "ready"} = build_conn() |> get(scoped) |> json_response(200)
+
+    profile = "readiness-generation-#{chain}"
+
+    on_exit(fn ->
+      ConfigStore.unregister_chain_runtime(profile, chain)
+      Catalog.build_from_config()
+    end)
+
+    :ok = ConfigStore.register_chain_runtime(profile, chain, %{chain_id: chain, providers: []})
+    assert Catalog.active_generation() != ConfigStore.route_generation()
+
+    assert %{"reason" => "catalog_not_published"} =
+             build_conn() |> get("/api/ready") |> json_response(503)
+
+    assert %{"checks" => [%{"reason" => "no_eligible_upstream"}]} =
+             build_conn() |> get(scoped) |> json_response(503)
+
+    assert %{"status" => "healthy"} = build_conn() |> get("/api/health") |> json_response(200)
+    assert Enum.map([ConfigStore, Catalog.Owner], &Process.whereis/1) == owners
+
+    :ok = Catalog.build_from_config()
+    :ok = BlockSyncRegistry.put_height(chain, instance_id, 100, :http)
+    assert %{"status" => "ready"} = build_conn() |> get("/api/ready") |> json_response(200)
+    assert %{"status" => "ready"} = build_conn() |> get(scoped) |> json_response(200)
+
+    assert %{"result" => result} =
+             build_conn()
+             |> post("/rpc/#{chain}", %{
+               "jsonrpc" => "2.0",
+               "id" => 1,
+               "method" => "eth_blockNumber",
+               "params" => []
+             })
+             |> json_response(200)
+
+    assert is_binary(result)
+    assert %{"status" => "healthy"} = build_conn() |> get("/api/health") |> json_response(200)
+    assert Enum.map([ConfigStore, Catalog.Owner], &Process.whereis/1) == owners
+  end
+
   test "unknown chain is not ready", %{chain: chain} do
     path = "/api/ready?profile=public&chain=#{chain + 1_000_000}"
 

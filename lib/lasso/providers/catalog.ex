@@ -360,12 +360,16 @@ defmodule Lasso.Providers.Catalog do
     end
   end
 
-  @doc "Reports whether the published routing catalog still has a live table."
+  @doc "Reports whether the live routing catalog matches the published configuration."
   @spec ready?() :: boolean()
   def ready? do
     case snapshot() do
-      %{table: table} -> table_available?(table)
-      nil -> false
+      %{table: table, generation: generation} = snapshot ->
+        generation == ConfigStore.route_generation() and table_available?(table) and
+          snapshot() == snapshot and generation == ConfigStore.route_generation()
+
+      nil ->
+        false
     end
   end
 
