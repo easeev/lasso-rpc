@@ -25,9 +25,8 @@
   # mint_web_socket 1.0.6 types UpgradeFailureError.headers as a nested header
   # list, while new/4 accepts and returns the flat Mint header representation.
   # That external contract collapses the successful handshake branch and its
-  # callers into false pattern/unused warnings.
+  # callers into false pattern warnings.
   ~r"lib/lasso/core/transport/websocket/client.ex.*pattern_match",
-  ~r"lib/lasso/core/transport/websocket/client.ex.*unused_fun",
 
   # VM metrics collector error handling
   ~r"lib/lasso/vm_metrics_collector.ex.*pattern_match",
