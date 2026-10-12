@@ -20,6 +20,25 @@ defmodule Lasso.Config.InstanceReloadTeardownTest do
     end
   end
 
+  setup do
+    env =
+      Map.new(
+        [:ws_client_module, :custom_origin_resolver, :http_client, :ws_startup_jitter_ms],
+        &{&1, Application.fetch_env(:lasso, &1)}
+      )
+
+    on_exit(fn ->
+      Enum.each(env, fn
+        {key, {:ok, value}} -> Application.put_env(:lasso, key, value)
+        {key, :error} -> Application.delete_env(:lasso, key)
+      end)
+    end)
+
+    Application.put_env(:lasso, :ws_client_module, Lasso.RPC.Transport.WebSocket.Client)
+    Application.put_env(:lasso, :ws_startup_jitter_ms, 0)
+    :ok
+  end
+
   test "reload retires a stalled WS handshake without delaying healthy HTTP serving" do
     chain = 760_000_000 + rem(System.unique_integer([:positive]), 100_000_000)
     slug = "reload-stop-#{chain}"
@@ -62,12 +81,6 @@ defmodule Lasso.Config.InstanceReloadTeardownTest do
 
     %{backend_module: backend_module, backend_state: backend_state} = :sys.get_state(ConfigStore)
 
-    env =
-      Map.new(
-        [:ws_client_module, :custom_origin_resolver, :http_client, :ws_startup_jitter_ms],
-        &{&1, Application.fetch_env(:lasso, &1)}
-      )
-
     on_exit(fn ->
       :gen_tcp.close(listener)
 
@@ -78,18 +91,11 @@ defmodule Lasso.Config.InstanceReloadTeardownTest do
 
       ConfigStore.reload()
 
-      Enum.each(env, fn
-        {key, {:ok, value}} -> Application.put_env(:lasso, key, value)
-        {key, :error} -> Application.delete_env(:lasso, key)
-      end)
-
       Plug.Cowboy.shutdown(ref)
       File.rm_rf!(root)
     end)
 
-    Application.put_env(:lasso, :ws_client_module, Lasso.RPC.Transport.WebSocket.Client)
     Application.put_env(:lasso, :http_client, Lasso.RPC.Transport.HTTP.Client.Finch)
-    Application.put_env(:lasso, :ws_startup_jitter_ms, 0)
 
     Application.put_env(:lasso, :custom_origin_resolver, fn host ->
       if host == "stalled.ws.test", do: send(observer, {:connecting_client, self()})
@@ -140,9 +146,6 @@ defmodule Lasso.Config.InstanceReloadTeardownTest do
   test "asynchronous handshake failures preserve network recovery classification" do
     id = "rejected-#{System.unique_integer([:positive])}"
     observer = self()
-    prior = Application.fetch_env(:lasso, :ws_client_module)
-    resolver = Application.fetch_env(:lasso, :custom_origin_resolver)
-    jitter = Application.fetch_env(:lasso, :ws_startup_jitter_ms)
     handler = {:connect_failure, id}
 
     endpoint = %Lasso.RPC.Transport.WebSocket.Endpoint{
@@ -166,22 +169,7 @@ defmodule Lasso.Config.InstanceReloadTeardownTest do
 
     on_exit(fn ->
       :telemetry.detach(handler)
-
-      Enum.each(
-        [
-          {:ws_client_module, prior},
-          {:custom_origin_resolver, resolver},
-          {:ws_startup_jitter_ms, jitter}
-        ],
-        fn
-          {key, {:ok, value}} -> Application.put_env(:lasso, key, value)
-          {key, :error} -> Application.delete_env(:lasso, key)
-        end
-      )
     end)
-
-    Application.put_env(:lasso, :ws_client_module, Lasso.RPC.Transport.WebSocket.Client)
-    Application.put_env(:lasso, :ws_startup_jitter_ms, 0)
 
     Application.put_env(:lasso, :custom_origin_resolver, fn _ ->
       {:error, :ssrf_blocked, "test blocked answer"}
@@ -195,6 +183,34 @@ defmodule Lasso.Config.InstanceReloadTeardownTest do
 
     state = :sys.get_state(owner)
     assert state.connected == false and state.reconnect_attempts >= 1
+    assert Process.alive?(owner)
+    assert (Plug.Test.conn(:get, "/api/health") |> LassoWeb.Endpoint.call([])).status == 200
+  end
+
+  test "a client that exits during handshake still advances existing recovery" do
+    id = "crashed-#{System.unique_integer([:positive])}"
+    observer = self()
+    attempts = start_supervised!({Agent, fn -> 0 end})
+
+    Application.put_env(:lasso, :custom_origin_resolver, fn _ ->
+      n = Agent.get_and_update(attempts, &{&1, &1 + 1})
+      send(observer, {:client_attempt, n, self(), Process.info(self(), :links)})
+      if n == 0, do: exit(:unexpected_connect_exit)
+      {:error, :ssrf_blocked, "test blocked answer"}
+    end)
+
+    endpoint = %Lasso.RPC.Transport.WebSocket.Endpoint{
+      profile: "public",
+      id: id,
+      name: id,
+      chain_id: 77_772,
+      ws_url: "ws://crashed.ws.test/rpc"
+    }
+
+    owner = start_supervised!({Connection, endpoint})
+    assert_receive {:client_attempt, 0, _first, {:links, first_links}}, 1_000
+    assert_receive {:client_attempt, 1, _second, {:links, second_links}}, 1_000
+    assert owner in first_links and owner in second_links
     assert Process.alive?(owner)
     assert (Plug.Test.conn(:get, "/api/health") |> LassoWeb.Endpoint.call([])).status == 200
   end

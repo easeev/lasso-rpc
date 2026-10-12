@@ -1664,15 +1664,10 @@ defmodule Lasso.RPC.Transport.WebSocket.Connection do
     {:noreply, state}
   end
 
-  # The typed disconnect event can be processed before the linked-process exit.
+  # Typed failures clear the client first; this exit belongs to a pending handshake.
   def handle_info({:EXIT, pid, reason}, %{connection: pid, connected: false} = state) do
-    Logger.debug("WebSocket client process exited (already disconnected)",
-      provider_id: state.endpoint.id,
-      reason: inspect(reason)
-    )
-
-    # Already disconnected, just clear the connection reference
-    {:noreply, %{state | connection: nil}}
+    error = ErrorNormalizer.normalize(reason, provider_id: state.endpoint.id, transport: :ws)
+    connect_failed(%{state | connection: nil}, {state.instance_id, :ws}, error)
   end
 
   # Handle supervisor shutdown signals - propagate cleanly

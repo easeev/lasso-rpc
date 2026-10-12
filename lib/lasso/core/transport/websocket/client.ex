@@ -22,17 +22,13 @@ defmodule Lasso.RPC.Transport.WebSocket.Client do
 
   @spec start_link(String.t(), module(), term(), keyword()) :: GenServer.on_start()
   def start_link(url, handler, handler_state, opts \\ []) do
-    init_arg =
-      if Keyword.get(opts, :async_connect, false),
-        do: {:async_connect, url, handler, handler_state, opts},
-        else: {url, handler, handler_state, opts}
-
-    case GenServer.start(__MODULE__, init_arg) do
-      {:ok, pid} ->
-        link_started_process(pid)
-
-      error ->
-        error
+    if Keyword.get(opts, :async_connect, false) do
+      GenServer.start_link(__MODULE__, {:async_connect, url, handler, handler_state, opts})
+    else
+      case GenServer.start(__MODULE__, {url, handler, handler_state, opts}) do
+        {:ok, pid} -> link_started_process(pid)
+        error -> error
+      end
     end
   end
 
