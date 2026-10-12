@@ -297,6 +297,32 @@ defmodule Lasso.RPC.MethodNotFoundRoutingTest do
 
   defp read(chain, opts \\ []), do: execute(chain, @read_method, @read_params, opts)
 
+  defp assert_http_serving(chain, owners) do
+    assert %{"id" => 1, "result" => "0x1"} = http_read(chain)
+    assert upstream_calls("control", @read_method) == 1
+    assert %{"status" => "healthy"} = http_json(:get, "/api/health")
+
+    for {owner, pid} <- owners do
+      assert Process.alive?(pid)
+      assert Process.whereis(owner) == pid
+    end
+  end
+
+  defp http_read(chain), do: http_json(:post, "/rpc/#{chain}")
+
+  defp http_json(method, path) do
+    {:ok, _} = Application.ensure_all_started(:inets)
+    port = LassoWeb.Endpoint.config(:http)[:port]
+    url = String.to_charlist("http://127.0.0.1:#{port}#{path}")
+    body = Jason.encode!(%{jsonrpc: "2.0", method: @read_method, params: @read_params, id: 1})
+    request = if method == :get, do: {url, []}, else: {url, [], ~c"application/json", body}
+
+    assert {:ok, {{_, 200, _}, _, response}} =
+             :httpc.request(method, request, [timeout: 5_000], [])
+
+    Jason.decode!(to_string(response))
+  end
+
   defp execute(chain, method, params, opts \\ []) do
     RequestPipeline.execute_via_channels(
       chain,
