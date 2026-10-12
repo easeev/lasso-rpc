@@ -293,8 +293,9 @@ Profile routes accept strategies and provider overrides too; see the
 `:chain` is a configured name such as `ethereum` or its EIP-155 ID, `1`. Routes
 without a profile use `public`.
 
-`GET /api/health` reports liveness and `GET /api/ready` reports routing
-readiness; [Deployment](docs/DEPLOYMENT.md) describes both.
+`GET /api/health` reports liveness and bare `GET /api/ready` reports replica
+readiness. Use `/api/ready?profile=public&chain=ethereum` for strict routing
+readiness; [Deployment](docs/DEPLOYMENT.md) describes these probes.
 
 ## Troubleshooting
 

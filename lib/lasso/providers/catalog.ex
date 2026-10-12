@@ -360,6 +360,19 @@ defmodule Lasso.Providers.Catalog do
     end
   end
 
+  @doc "Reports whether the live routing catalog matches the published configuration."
+  @spec ready?() :: boolean()
+  def ready? do
+    case snapshot() do
+      %{table: table, generation: generation} = snapshot ->
+        generation == ConfigStore.route_generation() and table_available?(table) and
+          snapshot() == snapshot and generation == ConfigStore.route_generation()
+
+      nil ->
+        false
+    end
+  end
+
   # Private
 
   defp safe_lookup(key) do
