@@ -829,6 +829,15 @@ defmodule Lasso.Core.Streaming.UpstreamSubscriptionPoolTest do
       profile: profile,
       instance_id: instance_id
     } do
+      backfill_provider = "backfill-#{System.unique_integer([:positive])}"
+
+      assert {:ok, ^backfill_provider} =
+               Lasso.Testing.MockHTTPProvider.start_mock(chain_id, %{
+                 id: backfill_provider,
+                 profile: profile,
+                 behavior: :healthy
+               })
+
       key = {:newHeads}
       {:ok, _sub} = UpstreamSubscriptionPool.subscribe_client(profile, chain_id, self(), key)
       :ok = wait_until_key_active(chain_id, key)
@@ -841,6 +850,18 @@ defmodule Lasso.Core.Streaming.UpstreamSubscriptionPoolTest do
       send(pool, {:reestablish_after_restart, key, instance_id})
       assert %{keys: keys_after_restart} = :sys.get_state(pool, 250)
       assert Map.has_key?(keys_after_restart, key)
+
+      assert TestHelper.eventually(fn ->
+               case get_pool_state(chain_id).keys[key] do
+                 %{resubscribe_pid: pid} when is_pid(pid) -> Process.alive?(pid)
+                 _ -> false
+               end
+             end)
+
+      coordinator = Lasso.Core.Streaming.StreamCoordinator.via(profile, chain_id, key)
+
+      assert %{failover_context: %{http_provider_id: ^backfill_provider}} =
+               :sys.get_state(coordinator, 250)
 
       send(pool, {:instance_subscription_invalidated, instance_id, key, :subscription_stale})
       assert %{keys: keys_after_stale} = :sys.get_state(pool, 250)
