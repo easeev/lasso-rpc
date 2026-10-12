@@ -13,6 +13,12 @@ defmodule Lasso.RPC.Transport.WebSocket.Handler do
     {:ok, state}
   end
 
+  @spec handle_connect_error(term(), map()) :: {:ok, map()}
+  def handle_connect_error(reason, state) do
+    send(state.parent, {:ws_connect_failed, self(), state.connection_generation, reason})
+    {:ok, state}
+  end
+
   @spec handle_frame({:text, String.t()}, map()) :: {:ok, map()} | {:close, map()}
   def handle_frame({:text, message}, state) do
     received_at = System.monotonic_time(:microsecond)

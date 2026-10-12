@@ -22,12 +22,13 @@ defmodule Lasso.RPC.Transport.WebSocket.Client do
 
   @spec start_link(String.t(), module(), term(), keyword()) :: GenServer.on_start()
   def start_link(url, handler, handler_state, opts \\ []) do
-    case GenServer.start(__MODULE__, {url, handler, handler_state, opts}) do
-      {:ok, pid} ->
-        link_started_process(pid)
-
-      error ->
-        error
+    if Keyword.get(opts, :async_connect, false) do
+      GenServer.start_link(__MODULE__, {:async_connect, url, handler, handler_state, opts})
+    else
+      case GenServer.start(__MODULE__, {url, handler, handler_state, opts}) do
+        {:ok, pid} -> link_started_process(pid)
+        error -> error
+      end
     end
   end
 
@@ -35,6 +36,16 @@ defmodule Lasso.RPC.Transport.WebSocket.Client do
   def cast(pid, message), do: GenServer.cast(pid, message)
 
   @impl true
+  def init({:async_connect, url, handler, handler_state, opts}) do
+    state = %__MODULE__{
+      handler: handler,
+      handler_state: handler_state,
+      owner_monitor: monitor_owner(handler_state, opts)
+    }
+
+    {:ok, state, {:continue, {:connect, url, opts}}}
+  end
+
   def init({url, handler, handler_state, opts}) do
     with {:ok, connection} <- connect(url, opts),
          {:ok, handler_state} <- handler.handle_connect(%{}, handler_state) do
@@ -51,6 +62,25 @@ defmodule Lasso.RPC.Transport.WebSocket.Client do
        )}
     else
       {:error, reason} -> {:stop, reason}
+    end
+  end
+
+  @impl true
+  def handle_continue({:connect, url, opts}, state) do
+    with {:ok, connection} <- connect(url, opts),
+         {:ok, handler_state} <- state.handler.handle_connect(%{}, state.handler_state) do
+      {:noreply,
+       %{
+         state
+         | conn: connection.conn,
+           request_ref: connection.request_ref,
+           websocket: connection.websocket,
+           handler_state: handler_state
+       }}
+    else
+      {:error, reason} ->
+        state.handler.handle_connect_error(reason, state.handler_state)
+        {:stop, :normal, state}
     end
   end
 

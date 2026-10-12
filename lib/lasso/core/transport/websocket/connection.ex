@@ -412,6 +412,9 @@ defmodule Lasso.RPC.Transport.WebSocket.Connection do
     end
   end
 
+  defp do_connect(%{connection: connection} = state, _breaker_id) when is_pid(connection),
+    do: {:noreply, state}
+
   defp do_connect(state, breaker_id) do
     ws_connection_pid = self()
     connection_generation = generate_connection_id()
@@ -429,37 +432,41 @@ defmodule Lasso.RPC.Transport.WebSocket.Connection do
         {:noreply, state}
 
       {:error, error} ->
-        jerr = normalize_connect_error(error, state.endpoint.id)
-
-        Logger.warning(
-          "Failed to connect to #{state.endpoint.name} (WebSocket): #{jerr.message} (code=#{inspect(jerr.code)})"
-        )
-
-        if jerr.breaker_penalty? do
-          _ = CircuitBreaker.report_external_bounded(breaker_id, {:error, jerr})
-        end
-
-        :telemetry.execute(
-          [:lasso, :websocket, :connection_failed],
-          %{},
-          %{
-            provider_id: state.endpoint.id,
-            chain_id: state.endpoint.chain_id,
-            error_code: jerr.code,
-            error_message: jerr.message,
-            retriable: jerr.retriable?,
-            will_reconnect: jerr.retriable?
-          }
-        )
-
-        broadcast_conn_event(state, fn provider_id ->
-          {:connection_error, provider_id, jerr}
-        end)
-
-        state = schedule_connect_error_recovery(state, jerr)
-
-        {:noreply, state}
+        connect_failed(state, breaker_id, error)
     end
+  end
+
+  defp connect_failed(state, breaker_id, error) do
+    jerr = normalize_connect_error(error, state.endpoint.id)
+
+    Logger.warning(
+      "Failed to connect to #{state.endpoint.name} (WebSocket): #{jerr.message} (code=#{inspect(jerr.code)})"
+    )
+
+    if jerr.breaker_penalty? do
+      _ = CircuitBreaker.report_external_bounded(breaker_id, {:error, jerr})
+    end
+
+    :telemetry.execute(
+      [:lasso, :websocket, :connection_failed],
+      %{},
+      %{
+        provider_id: state.endpoint.id,
+        chain_id: state.endpoint.chain_id,
+        error_code: jerr.code,
+        error_message: jerr.message,
+        retriable: jerr.retriable?,
+        will_reconnect: jerr.retriable?
+      }
+    )
+
+    broadcast_conn_event(state, fn provider_id ->
+      {:connection_error, provider_id, jerr}
+    end)
+
+    state = schedule_connect_error_recovery(state, jerr)
+
+    {:noreply, state}
   end
 
   @impl true
@@ -1067,6 +1074,18 @@ defmodule Lasso.RPC.Transport.WebSocket.Connection do
     {:noreply, state}
   end
 
+  def handle_info(
+        {:ws_connect_failed, connection, generation, reason},
+        %{connection: connection, connection_id: generation, connected: false} = state
+      ) do
+    error = ErrorNormalizer.normalize(reason, provider_id: state.endpoint.id, transport: :ws)
+    connect_failed(%{state | connection: nil}, {state.instance_id, :ws}, error)
+  end
+
+  def handle_info({:ws_connect_failed, _connection, _generation, _reason}, state) do
+    {:noreply, increment_transport_diagnostic(state, :stale_generation)}
+  end
+
   def handle_info({:ws_connected, _connection, _connection_generation}, state) do
     {:noreply, increment_transport_diagnostic(state, :stale_generation)}
   end
@@ -1645,15 +1664,10 @@ defmodule Lasso.RPC.Transport.WebSocket.Connection do
     {:noreply, state}
   end
 
-  # The typed disconnect event can be processed before the linked-process exit.
+  # Typed failures clear the client first; this exit belongs to a pending handshake.
   def handle_info({:EXIT, pid, reason}, %{connection: pid, connected: false} = state) do
-    Logger.debug("WebSocket client process exited (already disconnected)",
-      provider_id: state.endpoint.id,
-      reason: inspect(reason)
-    )
-
-    # Already disconnected, just clear the connection reference
-    {:noreply, %{state | connection: nil}}
+    error = ErrorNormalizer.normalize(reason, provider_id: state.endpoint.id, transport: :ws)
+    connect_failed(%{state | connection: nil}, {state.instance_id, :ws}, error)
   end
 
   # Handle supervisor shutdown signals - propagate cleanly
@@ -1680,6 +1694,8 @@ defmodule Lasso.RPC.Transport.WebSocket.Connection do
     Logger.info(
       "Terminating WebSocket connection #{state.endpoint.id}, reason: #{inspect(reason)}"
     )
+
+    if is_pid(state.connection), do: Process.exit(state.connection, :shutdown)
 
     # Clean up timers
     if state.heartbeat_ref do
@@ -1821,7 +1837,8 @@ defmodule Lasso.RPC.Transport.WebSocket.Connection do
     opts = [
       connection_id: endpoint.id,
       connection_generation: connection_generation,
-      extra_headers: endpoint.headers
+      extra_headers: endpoint.headers,
+      async_connect: true
     ]
 
     case ws_client().start_link(
