@@ -16,10 +16,10 @@ defmodule Lasso.RPC.Transport.WebSocket.Connection do
 
   Remote closes retain bounded, redacted `last_close` evidence in connection and
   instance WS status across recovery. Connection recovery is separate from RPC
-  retry eligibility: protocol/authentication refusals park, explicit capacity
-  refusals use existing rate-limit backoff, and an oversized message does not
-  park unrelated future requests. Generic policy refusal remains terminal unless
-  the peer explicitly identifies a recoverable capacity limit.
+  retry eligibility: protocol/authentication refusals park; code 1013 and
+  capacity-marked codes 1003/1008 use existing rate-limit backoff. An oversized
+  message does not park unrelated future requests. Generic policy refusal
+  remains terminal unless the peer explicitly identifies a recoverable capacity limit.
 
   ## Telemetry Events
 

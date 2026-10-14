@@ -147,9 +147,9 @@ fact: code, redacted reason, recovery disposition, observation time, and whether
 reconnection was scheduled at that close. It survives reconnection and resets
 when the connection owner is replaced.
 
-Protocol and authentication refusals park the connection. Explicit capacity
-refusals use the existing 60-second delay; other recoverable closes use the
-circuit-aware backoff. An oversized message remains nonretryable as an RPC but
+Protocol and authentication refusals park the connection. Code 1013 and
+capacity-marked codes 1003/1008 use the existing 60-second delay; other recoverable
+closes use the circuit-aware backoff. An oversized message remains nonretryable as an RPC but
 allows future WebSocket traffic to reconnect. Logs and telemetry use the same
 bounded, redacted reason.
 
