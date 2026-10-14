@@ -35,6 +35,122 @@ defmodule Lasso.Integration.WebSocketFailureScenarioTest do
     :ok
   end
 
+  for {code, reason, recovery} <- [
+        {1002, "Protocol error", :terminal},
+        {1008, "Authentication failed api_key=fixture_secret_0123456789", :terminal},
+        {4003, "Unauthorized authorization: Bearer abc123 password=\"two words\"", :terminal},
+        {4003, ~s({"error":"Unauthorized","token":"abc123"}), :terminal},
+        {4003, "Unauthorized auth=abc123", :terminal},
+        {1000, "Normal close pass=abc123", :reconnect},
+        {1009, "Message too big", :reconnect},
+        {1008, "Too many connections", :rate_limited}
+      ] do
+    @tag ws_close_recovery: %{code: code, reason: reason, recovery: recovery}
+    @tag timeout: 90_000
+    test "remote close #{code}/#{reason} retains evidence and uses #{recovery}", c do
+      %{code: code, reason: reason, recovery: recovery} = c.ws_close_recovery
+      setup_providers([%{id: "close_healthy", profile: "public", behavior: :healthy}])
+      assert_rpc_and_health(c.chain)
+
+      owners =
+        for name <- [Lasso.Config.ConfigStore, Lasso.Providers.Catalog.Owner, Lasso.Registry],
+            pid = Process.whereis(name),
+            is_pid(pid),
+            do: {name, pid}
+
+      assert owners != []
+      endpoint = build_endpoint(c.chain, "close_evidence")
+      {connection, endpoint} = start_connection_with_cb(endpoint)
+      Lasso.Test.Eventually.assert_eventually(fn -> :sys.get_state(connection).connected end)
+      before = :sys.get_state(connection)
+      transport = before.connection
+      instance = resolve_instance_id(endpoint)
+
+      log =
+        ExUnit.CaptureLog.capture_log(fn ->
+          TestSupport.MockWSClient.disconnect(transport, {:remote, code, reason})
+
+          Lasso.Test.Eventually.assert_eventually(fn ->
+            match?(
+              %{last_close: %{code: ^code}},
+              Lasso.Providers.InstanceState.read_ws_status(instance)
+            )
+          end)
+        end)
+
+      status = Lasso.Providers.InstanceState.read_ws_status(instance)
+      assert status.last_close.recovery == recovery
+      assert status.last_close.reconnect_scheduled? == (recovery != :terminal)
+      assert byte_size(status.last_close.reason) <= 123
+      assert is_integer(status.last_close.observed_at_ms)
+      assert Connection.status(instance).last_close == status.last_close
+
+      for secret <- ["fixture_secret_0123456789", "abc123", "two words"] do
+        refute log =~ secret
+        refute status.last_close.reason =~ secret
+      end
+
+      if recovery == :terminal do
+        state = :sys.get_state(connection)
+        refute state.connected
+        assert state.reconnect_ref == nil
+        assert state.reconnect_attempts == before.reconnect_attempts
+      else
+        remaining =
+          case :sys.get_state(connection).reconnect_ref do
+            ref when is_reference(ref) -> Process.read_timer(ref) || 0
+            nil -> 0
+          end
+
+        Lasso.Test.Eventually.assert_eventually(
+          fn ->
+            state = :sys.get_state(connection)
+            state.connected and state.connection != transport
+          end,
+          timeout: remaining + 5_000
+        )
+
+        assert %{status: :connected, last_close: last_close} =
+                 Lasso.Providers.InstanceState.read_ws_status(instance)
+
+        assert last_close == status.last_close
+
+        send(
+          connection,
+          {:ws_disconnect_event, transport, before.connection_id,
+           {:ws_disconnect, :close_frame, 1008, "Unauthorized"}}
+        )
+
+        :sys.get_state(connection)
+        assert Lasso.Providers.InstanceState.read_ws_status(instance).last_close == last_close
+      end
+
+      assert_rpc_and_health(c.chain)
+      for {name, pid} <- owners, do: assert(Process.whereis(name) == pid and Process.alive?(pid))
+      assert Process.alive?(connection)
+      cleanup_connection(endpoint)
+    end
+  end
+
+  defp assert_rpc_and_health(chain) do
+    {:ok, _apps} = Application.ensure_all_started(:inets)
+    base = "http://127.0.0.1:#{LassoWeb.Endpoint.config(:http)[:port]}"
+    body = Jason.encode!(%{jsonrpc: "2.0", method: "eth_getLogs", params: [], id: 1})
+
+    assert {:ok, {{_, 200, _}, _, response}} =
+             :httpc.request(
+               :post,
+               {String.to_charlist(base <> "/rpc/#{chain}"), [], ~c"application/json", body},
+               [],
+               []
+             )
+
+    assert Jason.decode!(to_string(response))["result"]
+
+    assert {:ok, {{_, 200, _}, _, _}} =
+             :httpc.request(:get, {String.to_charlist(base <> "/api/health"), []}, [], [])
+  end
+
   # Helper to build test endpoint
   defp build_endpoint(chain, id_suffix, opts \\ []) do
     %Endpoint{
