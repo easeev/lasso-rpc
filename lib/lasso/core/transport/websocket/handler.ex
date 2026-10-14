@@ -3,8 +3,6 @@ defmodule Lasso.RPC.Transport.WebSocket.Handler do
   Projects WebSocket transport callbacks into typed messages for the owning connection process.
   """
 
-  require Logger
-
   alias Lasso.Core.Transport.UpstreamResponse
 
   @spec handle_connect(map(), map()) :: {:ok, map()}
@@ -94,11 +92,6 @@ defmodule Lasso.RPC.Transport.WebSocket.Handler do
 
   @spec handle_disconnect(map(), map()) :: {:ok, map()}
   def handle_disconnect(%{reason: reason}, state) do
-    Logger.debug("WebSocket client disconnected",
-      provider_id: state.endpoint.id,
-      reason: inspect(reason)
-    )
-
     disconnect_info =
       case reason do
         # Remote close frame with code and message

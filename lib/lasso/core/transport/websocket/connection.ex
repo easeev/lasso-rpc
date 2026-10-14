@@ -14,6 +14,13 @@ defmodule Lasso.RPC.Transport.WebSocket.Connection do
   - Independent reconnection strategies
   - Process supervision and monitoring
 
+  Remote closes retain bounded, redacted `last_close` evidence in connection and
+  instance WS status across recovery. Connection recovery is separate from RPC
+  retry eligibility: protocol/authentication refusals park; code 1013 and
+  capacity-marked codes 1003/1008 use existing rate-limit backoff. An oversized
+  message does not park unrelated future requests. Generic policy refusal
+  remains terminal unless the peer explicitly identifies a recoverable capacity limit.
+
   ## Telemetry Events
 
   This module emits comprehensive telemetry events for observability:
@@ -177,10 +184,11 @@ defmodule Lasso.RPC.Transport.WebSocket.Connection do
       reconnect_ref: nil,
       stability_timer_ref: nil,
       connection_stable: false,
+      last_close: nil,
       connection_id: nil
     }
 
-    write_ws_status(state.instance_id, :reconnecting, state.reconnect_attempts)
+    write_ws_status(state, :reconnecting)
 
     # Stagger the initial connection attempt with a random delay so we don't
     # synchronize with sibling WS connections to the same CDN at boot. When the
@@ -540,7 +548,8 @@ defmodule Lasso.RPC.Transport.WebSocket.Connection do
       transport_tombstones: count_send_state(state.transport_pending, :tombstone),
       queued_control_sends: control_sends,
       transport_pending_limit: state.transport_pending_limit,
-      transport_diagnostics: state.transport_diagnostics
+      transport_diagnostics: state.transport_diagnostics,
+      last_close: state.last_close
     }
 
     {:reply, status, state}
@@ -1064,7 +1073,7 @@ defmodule Lasso.RPC.Transport.WebSocket.Connection do
         schedule_stability_check(state)
       end
 
-    write_ws_status(state.instance_id, :connected, state.reconnect_attempts)
+    write_ws_status(state, :connected)
 
     broadcast_conn_event(state, fn provider_id ->
       {:ws_connected, provider_id, connection_id}
@@ -1221,10 +1230,13 @@ defmodule Lasso.RPC.Transport.WebSocket.Connection do
   end
 
   def handle_info({:ws_disconnect, :close_frame, code, reason}, state) do
+    recovery = close_recovery(code, reason)
+    safe_reason = diagnostic_close_reason(reason)
+
     Logger.debug("Connection received ws_disconnect close_frame",
       provider_id: state.endpoint.id,
       code: code,
-      reason: inspect(reason)
+      reason: safe_reason
     )
 
     # Capture stability before canceling timer
@@ -1244,7 +1256,7 @@ defmodule Lasso.RPC.Transport.WebSocket.Connection do
     had_pending = active_pending?(state)
 
     jerr =
-      ErrorNormalizer.normalize({:ws_close, code, reason},
+      ErrorNormalizer.normalize({:ws_close, code, safe_reason},
         provider_id: state.endpoint.id,
         transport: :ws
       )
@@ -1264,7 +1276,7 @@ defmodule Lasso.RPC.Transport.WebSocket.Connection do
 
     if should_penalize do
       Logger.warning(
-        "WebSocket closed: code=#{code}, reason=#{inspect(reason)}, " <>
+        "WebSocket closed: code=#{code}, reason=#{inspect(safe_reason)}, " <>
           "was_stable=#{was_stable}, had_active_traffic=#{had_pending} (provider: #{state.endpoint.id})"
       )
     else
@@ -1284,7 +1296,7 @@ defmodule Lasso.RPC.Transport.WebSocket.Connection do
       %{
         provider_id: state.endpoint.id,
         chain_id: state.endpoint.chain_id,
-        reason: reason,
+        reason: safe_reason,
         code: code,
         had_active_traffic: had_pending,
         was_stable: was_stable,
@@ -1318,10 +1330,31 @@ defmodule Lasso.RPC.Transport.WebSocket.Connection do
       if idle_timeout do
         schedule_reconnect(state, :idle_timeout)
       else
-        schedule_close_recovery(state, code, jerr)
+        schedule_close_recovery(state, recovery)
       end
 
-    write_ws_status(state.instance_id, :disconnected, state.reconnect_attempts)
+    state = %{
+      state
+      | last_close: %{
+          code: code,
+          reason: safe_reason,
+          recovery: if(idle_timeout, do: :idle_timeout, else: recovery),
+          reconnect_scheduled?: is_reference(state.reconnect_ref),
+          observed_at_ms: System.system_time(:millisecond)
+        }
+    }
+
+    Logger.log(
+      if(recovery == :terminal, do: :warning, else: :info),
+      "WebSocket close recovery",
+      provider_id: state.endpoint.id,
+      code: code,
+      reason: safe_reason,
+      recovery: state.last_close.recovery,
+      reconnect_scheduled: state.last_close.reconnect_scheduled?
+    )
+
+    write_ws_status(state, :disconnected)
     {:noreply, state}
   end
 
@@ -1411,7 +1444,7 @@ defmodule Lasso.RPC.Transport.WebSocket.Connection do
       end)
 
       state = schedule_reconnect_with_circuit_check(state)
-      write_ws_status(state.instance_id, :disconnected, state.reconnect_attempts)
+      write_ws_status(state, :disconnected)
       {:noreply, state}
     rescue
       e ->
@@ -1660,7 +1693,7 @@ defmodule Lasso.RPC.Transport.WebSocket.Connection do
     end)
 
     state = schedule_reconnect_with_circuit_check(state)
-    write_ws_status(state.instance_id, :disconnected, state.reconnect_attempts)
+    write_ws_status(state, :disconnected)
     {:noreply, state}
   end
 
@@ -1718,7 +1751,7 @@ defmodule Lasso.RPC.Transport.WebSocket.Connection do
       {:ws_disconnected, provider_id, terminated_error}
     end)
 
-    write_ws_status(state.instance_id, :disconnected, state.reconnect_attempts)
+    write_ws_status(state, :disconnected)
 
     :ok
   end
@@ -1911,7 +1944,7 @@ defmodule Lasso.RPC.Transport.WebSocket.Connection do
             reconnect_ref: ref
         }
 
-        write_ws_status(new_state.instance_id, :reconnecting, new_state.reconnect_attempts)
+        write_ws_status(new_state, :reconnecting)
         new_state
 
       _ ->
@@ -1935,7 +1968,7 @@ defmodule Lasso.RPC.Transport.WebSocket.Connection do
     )
 
     ref = Process.send_after(self(), {:reconnect}, delay)
-    write_ws_status(state.instance_id, :reconnecting, state.reconnect_attempts)
+    write_ws_status(state, :reconnecting)
     %{state | reconnect_ref: ref}
   end
 
@@ -1948,14 +1981,85 @@ defmodule Lasso.RPC.Transport.WebSocket.Connection do
   defp schedule_connect_error_recovery(state, %JError{retriable?: true}),
     do: schedule_reconnect(state)
 
-  defp schedule_close_recovery(state, _code, %JError{retriable?: false}), do: state
+  # Connection recovery is distinct from whether a failed RPC may be retried.
+  # A too-large message, for example, must not permanently park future WS traffic.
+  defp schedule_close_recovery(state, :terminal), do: state
 
-  defp schedule_close_recovery(state, 1013, %JError{retriable?: true}) do
-    schedule_reconnect_rate_limited(state, @default_rate_limit_delay_ms)
+  defp schedule_close_recovery(state, :rate_limited),
+    do: schedule_reconnect_rate_limited(state, @default_rate_limit_delay_ms)
+
+  defp schedule_close_recovery(state, :reconnect),
+    do: schedule_reconnect_with_circuit_check(state)
+
+  defp close_recovery(1013, _reason), do: :rate_limited
+
+  defp close_recovery(code, reason) when code in [1003, 1008] do
+    cond do
+      authentication_close?(reason) -> :terminal
+      capacity_close?(reason) -> :rate_limited
+      true -> :terminal
+    end
   end
 
-  defp schedule_close_recovery(state, _code, %JError{retriable?: true}),
-    do: schedule_reconnect_with_circuit_check(state)
+  defp close_recovery(code, _reason) when code in [1002, 1007, 1010], do: :terminal
+
+  defp close_recovery(code, reason) when code >= 3000 do
+    if authentication_close?(reason), do: :terminal, else: :reconnect
+  end
+
+  defp close_recovery(_code, _reason), do: :reconnect
+
+  defp capacity_close?(reason) when is_binary(reason) and byte_size(reason) <= 123 do
+    Regex.match?(~r/rate.?limit|too many|connection.?limit|capacity|overload|throttl/i, reason)
+  end
+
+  defp capacity_close?(_reason), do: false
+
+  defp authentication_close?(reason) when is_binary(reason) and byte_size(reason) <= 123 do
+    Regex.match?(
+      ~r/unauthori[sz]ed|forbidden|(?:authentication|authorization|auth) (?:failed|denied|rejected|required)|invalid (?:api.?key|token)|expired (?:api.?key|token)|access denied/i,
+      reason
+    )
+  end
+
+  defp authentication_close?(_reason), do: false
+
+  defp diagnostic_close_reason(reason) when is_binary(reason) and byte_size(reason) <= 123 do
+    if String.valid?(reason) do
+      text =
+        if Regex.match?(
+             ~r/key|token|auth|bearer|basic|pass|secret|credential/iu,
+             reason
+           ) do
+          cond do
+            authentication_close?(reason) ->
+              "Authentication refusal (credential details redacted)"
+
+            capacity_close?(reason) ->
+              "Capacity refusal (credential details redacted)"
+
+            true ->
+              "Credential-bearing close reason redacted"
+          end
+        else
+          reason
+          |> Lasso.URLMask.mask_in_string()
+          |> String.replace(~r/[\x00-\x1f\x7f]/u, " ")
+          |> String.replace(~r/[A-Za-z0-9_=-]{20,}/u, "[REDACTED]")
+        end
+
+      # Redaction can expand short values. Keep the final fact within the frame's
+      # reason bound without splitting a UTF-8 character.
+      case :unicode.characters_to_binary(binary_part(text, 0, min(byte_size(text), 123))) do
+        text when is_binary(text) -> text
+        {:incomplete, text, _rest} -> text
+      end
+    else
+      "invalid close reason"
+    end
+  end
+
+  defp diagnostic_close_reason(_reason), do: "invalid or oversized close reason"
 
   defp rate_limit_delay(%JError{data: data}) when is_map(data) do
     data
@@ -2017,7 +2121,7 @@ defmodule Lasso.RPC.Transport.WebSocket.Connection do
           reconnect_ref: ref
       }
 
-      write_ws_status(new_state.instance_id, :reconnecting, new_state.reconnect_attempts)
+      write_ws_status(new_state, :reconnecting)
       new_state
     else
       # Max attempts reached - continue with extended backoff (5 minutes)
@@ -2055,7 +2159,7 @@ defmodule Lasso.RPC.Transport.WebSocket.Connection do
           reconnect_ref: ref
       }
 
-      write_ws_status(new_state.instance_id, :reconnecting, new_state.reconnect_attempts)
+      write_ws_status(new_state, :reconnecting)
       new_state
     end
   end
@@ -2442,7 +2546,7 @@ defmodule Lasso.RPC.Transport.WebSocket.Connection do
     }
 
     broadcast_conn_event(state, fn provider_id -> {:ws_disconnected, provider_id, error} end)
-    write_ws_status(state.instance_id, :disconnected, state.reconnect_attempts)
+    write_ws_status(state, :disconnected)
     schedule_reconnect_with_circuit_check(state)
   end
 
@@ -2798,14 +2902,15 @@ defmodule Lasso.RPC.Transport.WebSocket.Connection do
     end
   end
 
-  defp write_ws_status(instance_id, status, reconnect_attempts) do
+  defp write_ws_status(state, status) do
     :ets.insert(:lasso_instance_state, {
-      {:ws_status, instance_id},
+      {:ws_status, state.instance_id},
       %{
         status: status,
-        reconnect_attempts: reconnect_attempts,
+        reconnect_attempts: state.reconnect_attempts,
         grace_until_ms: nil,
-        last_event_ms: System.system_time(:millisecond)
+        last_event_ms: System.system_time(:millisecond),
+        last_close: state.last_close
       }
     })
   rescue
