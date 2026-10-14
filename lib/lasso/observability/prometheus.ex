@@ -367,11 +367,11 @@ defmodule Lasso.Observability.Prometheus do
   defp blocks_behind(profile, chain, instance_id, transport) when is_binary(instance_id) do
     now_ms = System.system_time(:millisecond)
 
-    with %{generation: generation} = catalog <- Catalog.snapshot(),
+    with %{} = catalog <- Catalog.snapshot(),
          {:ok, plan} <- Catalog.get_routing_plan(catalog, profile, chain),
          true <- instance_id in plan.head_scope.instance_ids,
          %{} = route <- Enum.find(plan.providers, &(&1.instance_id == instance_id)),
-         {:ok, snapshot} <- BlockRegistry.get_head_snapshot(plan.head_scope, generation, now_ms),
+         {:ok, snapshot} <- BlockRegistry.get_cached_head_snapshot(plan.head_scope),
          %{status: status, lag: lag} when status in [:eligible, :lagging] and is_integer(lag) <-
            LagCalculation.assess_transport(
              chain,

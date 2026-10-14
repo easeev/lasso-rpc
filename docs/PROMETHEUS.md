@@ -122,8 +122,9 @@ for the scope. A transport routing cannot assess has no sample, so compare
 
 A fresh head observation does not prove routing eligibility: identity, circuit,
 method capability, lag policy and request range must still permit dispatch.
-Missing head lag means no fresh evidence, not zero lag. Disabled WS transports
-have no circuit snapshot; consult `lasso_provider_transport_configured` before
+Scrapes read routing's valid cached head snapshots; cold or expired snapshots
+are omitted. Missing head lag means no fresh evidence, not zero lag. Disabled WS
+transports have no circuit snapshot; consult `lasso_provider_transport_configured` before
 interpreting missing circuit-admission samples as a failure.
 
 ## Multi-tenant hosts
