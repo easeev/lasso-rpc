@@ -13,6 +13,58 @@ defmodule LassoWeb.Dashboard.EventStreamTest do
     :ok
   end
 
+  test "method latency aggregates ignore unmeasured routing decisions" do
+    profile = "method-duration-#{System.unique_integer([:positive])}"
+    {:ok, pid} = EventStream.ensure_started(profile)
+
+    on_exit(fn ->
+      if Process.alive?(pid),
+        do: DynamicSupervisor.terminate_child(Lasso.Dashboard.StreamSupervisor, pid)
+    end)
+
+    assert :ok = EventStream.subscribe(profile)
+    assert_receive {:dashboard_snapshot, _}
+
+    events =
+      for {provider, durations} <- [{"timed", [10, 30]}, {"mixed", [20, nil]}, {"untimed", [nil]}],
+          duration <- durations do
+        %RoutingDecision{
+          request_id: "duration-#{System.unique_integer([:positive])}",
+          provider_id: provider,
+          chain_id: 1,
+          method: "eth_blockNumber",
+          result: :success,
+          duration_ms: duration,
+          ts: System.system_time(:millisecond),
+          source_node_id: "iad"
+        }
+      end
+
+    :sys.replace_state(pid, fn state ->
+      %{
+        state
+        | pending_events: Enum.reverse(events),
+          pending_count: length(events)
+      }
+    end)
+
+    send(pid, :tick)
+    assert_receive {:dashboard_batch, %{metrics: metrics}}, 1_000
+    assert Process.alive?(pid)
+
+    for {provider, count, average, p50, p95} <- [
+          {"timed", 2, 20.0, 10, 30},
+          {"mixed", 2, 20.0, 20, 20},
+          {"untimed", 1, 0.0, nil, nil}
+        ] do
+      assert [%{method: "eth_blockNumber", total_calls: ^count, avg_duration_ms: ^average}] =
+               get_in(metrics, [provider, :aggregate, :rpc_stats])
+
+      assert get_in(metrics, [provider, :aggregate, :p50_latency]) == p50
+      assert get_in(metrics, [provider, :aggregate, :p95_latency]) == p95
+    end
+  end
+
   describe "request ID deduplication" do
     test "duplicate request IDs are filtered out" do
       seen = %{}

@@ -945,14 +945,12 @@ defmodule LassoWeb.Dashboard.EventStream do
     |> Enum.map(fn {method, method_events} ->
       total = length(method_events)
       successes = Enum.count(method_events, &(&1.result == :success))
-      durations = Enum.map(method_events, & &1.duration_ms)
-      avg_duration = if total > 0, do: Enum.sum(durations) / total, else: 0.0
 
       %{
         method: method,
         total_calls: total,
         success_rate: if(total > 0, do: successes / total, else: 0.0),
-        avg_duration_ms: avg_duration
+        avg_duration_ms: average_duration(measured_durations(method_events))
       }
     end)
     |> Enum.sort_by(& &1.total_calls, :desc)
@@ -972,13 +970,25 @@ defmodule LassoWeb.Dashboard.EventStream do
     Float.round(provider_calls / chain_calls * 100, 1)
   end
 
-  defp compute_percentile([], _p), do: nil
-
   defp compute_percentile(events, p) do
-    durations = events |> Enum.map(& &1.duration_ms) |> Enum.sort()
-    index = max(0, round(length(durations) * p / 100) - 1)
-    Enum.at(durations, index)
+    case events |> measured_durations() |> Enum.sort() do
+      [] ->
+        nil
+
+      durations ->
+        index = max(0, round(length(durations) * p / 100) - 1)
+        Enum.at(durations, index)
+    end
   end
+
+  # A routing decision can be published before a duration is known. Latency
+  # stats describe measured samples; an absent duration is not a zero.
+  defp measured_durations(events) do
+    for %{duration_ms: duration} when is_number(duration) <- events, do: duration
+  end
+
+  defp average_duration([]), do: 0.0
+  defp average_duration(durations), do: Enum.sum(durations) / length(durations)
 
   # Block height helpers
 
