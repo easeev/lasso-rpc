@@ -1981,4 +1981,59 @@ defmodule Lasso.RPC.RequestPipelineIntegrationTest do
       remaining_ms -> flunk("dashboard did not receive routing event #{request_id}")
     end
   end
+
+  test "a handler shut down mid-request records caller abandonment and returns", %{chain: chain} do
+    setup_providers([
+      %{
+        id: "slow_upstream",
+        profile: "public",
+        background_observations: false,
+        behavior:
+          {:conditional,
+           fn _method, _params, _state ->
+             Process.sleep(3_000)
+             {:ok, "0x1"}
+           end}
+      }
+    ])
+
+    test_pid = self()
+
+    # Stands in for Cowboy's connection process, which stops a request handler
+    # with exit(handler, :shutdown) when the client connection closes.
+    connection =
+      spawn(fn ->
+        handler =
+          spawn_link(fn ->
+            result =
+              RequestPipeline.execute_via_channels(chain, "eth_blockNumber", [], %RequestOptions{
+                profile: "public",
+                strategy: :priority,
+                timeout_ms: 5_000
+              })
+
+            send(test_pid, {:handler_result, result})
+          end)
+
+        send(test_pid, {:handler, handler})
+        Process.sleep(:infinity)
+      end)
+
+    assert_receive {:handler, handler}, 1_000
+    handler_monitor = Process.monitor(handler)
+    Process.sleep(300)
+    Process.exit(handler, :shutdown)
+
+    assert_receive {:handler_result, {:error, error, ctx}}, 2_000
+    assert error.category == :cancelled
+
+    assert %Lasso.RPC.AttemptTerminal.Cancelled{reason: :owner_shutdown} =
+             ctx.terminal_attempt_fact
+
+    assert %Lasso.RPC.RequestTerminal.CallerAbandonment{} =
+             RequestPipeline.build_request_terminal(:error, error, ctx)
+
+    assert_receive {:DOWN, ^handler_monitor, :process, ^handler, :normal}, 1_000
+    Process.exit(connection, :kill)
+  end
 end

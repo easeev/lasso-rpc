@@ -810,9 +810,10 @@ defmodule Lasso.Core.Transport.UpstreamResponse do
            error_data: data
          },
          _client_id,
-         _restored_bytes
+         restored_bytes
        ) do
-    {:error, JError.new(code, message, data: data)}
+    {:error,
+     JError.new(code, message, data: data, source: :jsonrpc, raw_response: restored_bytes)}
   end
 
   defp only_json_whitespace?(<<>>), do: true

@@ -2,7 +2,7 @@ defmodule Lasso.Providers.ChainIdentity do
   @moduledoc """
   Observed HTTP chain identity, scoped to a physical endpoint.
 
-  Configuration generation fences probe writes; rejection survives unrelated
+  Published catalog generation fences probe writes; rejection survives unrelated
   configuration changes until a matching probe or physical endpoint teardown.
 
   Unknown identity preserves normal admission. An explicit malformed or mismatched
@@ -11,7 +11,6 @@ defmodule Lasso.Providers.ChainIdentity do
   HTTP observations never authorize or reject the independent WebSocket endpoint.
   """
 
-  alias Lasso.Config.ConfigStore
   alias Lasso.Providers.Catalog
 
   @table :lasso_instance_state
@@ -49,7 +48,7 @@ defmodule Lasso.Providers.ChainIdentity do
   @spec record(observation(), :verified | :rejected) :: :ok
   def record(%{instance_id: id, generation: generation, sequence: sequence}, status)
       when status in [:verified, :rejected] do
-    if Catalog.active_generation() == generation and ConfigStore.route_generation() == generation do
+    if Catalog.active_generation() == generation do
       key = {:chain_identity, id, :http}
       row = {key, generation, sequence, status}
 

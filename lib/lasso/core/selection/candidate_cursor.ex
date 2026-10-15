@@ -20,7 +20,7 @@ defmodule Lasso.RPC.Selection.CandidateCursor do
   end
 
   alias Lasso.BlockSync.Observation
-  alias Lasso.Config.{ConfigStore, MethodConstraints}
+  alias Lasso.Config.MethodConstraints
   alias Lasso.Observations.HeadSnapshot
   alias Lasso.Providers.{CandidateListing, Catalog, HeadEvidence, InstanceState}
 
@@ -51,6 +51,7 @@ defmodule Lasso.RPC.Selection.CandidateCursor do
   defstruct @enforce_keys ++
               [
                 candidate_labels: [],
+                effect_context: %{},
                 preferred: [],
                 preferred_head_height: nil,
                 deadline_us: nil,
@@ -197,10 +198,20 @@ defmodule Lasso.RPC.Selection.CandidateCursor do
         |> keep_head_eligible_routes(plan, filters, consensus_height)
       end
 
+    {descriptors, effect_context} =
+      case descriptors do
+        {:error, rejections, count} ->
+          {[], %{selection_rejections: rejections, selection_rejection_count: count}}
+
+        descriptors ->
+          {descriptors, %{}}
+      end
+
     limit = Keyword.get(opts, :limit, 1000)
 
     %__MODULE__{
       snapshot: snapshot,
+      effect_context: effect_context,
       plan: plan,
       method: method,
       filters: filters,
@@ -261,16 +272,27 @@ defmodule Lasso.RPC.Selection.CandidateCursor do
     do: Enum.any?(tiers, fn {_tier, queue} -> not :queue.is_empty(queue) end)
 
   @spec next(t()) :: {:ok, Channel.t(), t()} | :done | :stale
-  def next(%__MODULE__{returned: returned, limit: limit}) when returned >= limit, do: :done
+  def next(cursor) do
+    case next_with_evidence(cursor) do
+      {terminal, _remaining} when terminal in [:done, :stale] -> terminal
+      selected -> selected
+    end
+  end
 
-  def next(%__MODULE__{} = cursor) do
+  @doc "Retains bounded rejection evidence when a cursor is exhausted or invalidated."
+  @spec next_with_evidence(t()) :: {:ok, Channel.t(), t()} | {:done | :stale, t()}
+  def next_with_evidence(%__MODULE__{returned: returned, limit: limit} = cursor)
+      when returned >= limit,
+      do: {:done, cursor}
+
+  def next_with_evidence(cursor) do
     if current?(cursor) do
       case cursor.preferred do
         [channel | rest] -> return(channel, %{cursor | preferred: rest})
         [] -> scan(cursor)
       end
     else
-      :stale
+      {:stale, cursor}
     end
   end
 
@@ -319,8 +341,30 @@ defmodule Lasso.RPC.Selection.CandidateCursor do
       {:ok, channel, tier, false} ->
         cursor |> defer(:unsupported_deferred, tier, channel) |> scan()
 
-      :skip ->
-        scan(cursor)
+      {:skip, reason} ->
+        case scan(cursor) do
+          {terminal, remaining} when terminal in [:done, :stale] ->
+            rejection = %{
+              provider_id: descriptor_provider_id(descriptor),
+              transport: descriptor_transport(descriptor),
+              reason: reason
+            }
+
+            effect_context = remaining.effect_context
+
+            rejections =
+              Enum.take([rejection | Map.get(effect_context, :selection_rejections, [])], 32)
+
+            effect_context =
+              effect_context
+              |> Map.put(:selection_rejections, rejections)
+              |> Map.update(:selection_rejection_count, 1, &(&1 + 1))
+
+            {terminal, %{remaining | effect_context: effect_context}}
+
+          selected ->
+            selected
+        end
     end
   end
 
@@ -353,7 +397,7 @@ defmodule Lasso.RPC.Selection.CandidateCursor do
           deferred_ranking: next_deferred
       })
     else
-      :stale
+      {:stale, cursor}
     end
   end
 
@@ -370,7 +414,7 @@ defmodule Lasso.RPC.Selection.CandidateCursor do
           deferred_ranking: nil
       })
     else
-      :stale
+      {:stale, cursor}
     end
   end
 
@@ -414,7 +458,8 @@ defmodule Lasso.RPC.Selection.CandidateCursor do
     end
   end
 
-  defp pop_deferred(cursor, _field, []), do: if(current?(cursor), do: :done, else: :stale)
+  defp pop_deferred(cursor, _field, []),
+    do: if(current?(cursor), do: {:done, cursor}, else: {:stale, cursor})
 
   defp pop_deferred(cursor, field, [tier | rest]) do
     cursor = order_deferred(cursor, field, tier)
@@ -434,7 +479,7 @@ defmodule Lasso.RPC.Selection.CandidateCursor do
       seen = cursor.diversity_seen && MapSet.put(cursor.diversity_seen, channel.instance_id)
       {:ok, channel, %{cursor | returned: cursor.returned + 1, diversity_seen: seen}}
     else
-      :stale
+      {:stale, cursor}
     end
   end
 
@@ -466,7 +511,7 @@ defmodule Lasso.RPC.Selection.CandidateCursor do
   defp materialize(cursor, {provider, transport}) do
     filters = %{SelectionFilters.to_map(cursor.filters) | protocol: transport}
 
-    case CandidateListing.routing_candidate_from_plan(
+    case CandidateListing.routing_candidate_result_from_plan(
            cursor.plan,
            provider,
            filters,
@@ -478,11 +523,34 @@ defmodule Lasso.RPC.Selection.CandidateCursor do
              tier when tier in 1..4 <- tier(circuit_state, rate_limited, transport) do
           {:ok, channel, tier, AdapterFilter.method_supported?(channel, cursor.method)}
         else
-          _unavailable -> :skip
+          {:error, error} ->
+            {:skip, channel_failure(error)}
+
+          _unavailable ->
+            {:skip,
+             gate_failure(
+               cursor.filters,
+               Map.fetch!(circuit_state, transport),
+               Map.fetch!(rate_limited, transport)
+             )}
         end
 
-      nil ->
-        :skip
+      {:error, candidate} ->
+        state = Map.get(candidate.circuit_state, transport)
+
+        reason =
+          cond do
+            transport not in provider.transports ->
+              :transport_not_configured
+
+            transport == :ws and transport not in candidate.transports ->
+              :ws_disconnected
+
+            true ->
+              gate_failure(cursor.filters, state, Map.get(candidate.rate_limited, transport))
+          end
+
+        {:skip, reason}
     end
   end
 
@@ -502,7 +570,9 @@ defmodule Lasso.RPC.Selection.CandidateCursor do
          {:ok, channel} <- channel(cursor, candidate, transport) do
       {:ok, channel, tier, AdapterFilter.method_supported?(channel, cursor.method)}
     else
-      _unavailable -> :skip
+      false -> {:skip, gate_failure(cursor.filters, circuit_state, rate_limited?)}
+      {:error, error} -> {:skip, channel_failure(error)}
+      _unavailable -> {:skip, :circuit_unavailable}
     end
   end
 
@@ -527,6 +597,21 @@ defmodule Lasso.RPC.Selection.CandidateCursor do
         row
     end
   end
+
+  defp descriptor_transport({:ranked, _candidate, transport}), do: transport
+  defp descriptor_transport({_provider, transport}), do: transport
+
+  defp gate_failure(_filters, :unavailable, _), do: :circuit_unavailable
+  defp gate_failure(_filters, :open, _), do: :circuit_open
+  defp gate_failure(%{include_half_open: false}, :half_open, _), do: :half_open_excluded
+  defp gate_failure(_filters, _state, true), do: :rate_limited
+  defp gate_failure(_filters, _state, _), do: :candidate_filtered
+
+  defp channel_failure(reason)
+       when reason in [:registry_unavailable, :registry_timeout, :provider_not_found],
+       do: reason
+
+  defp channel_failure(_), do: :channel_lookup_failed
 
   defp channel(cursor, candidate, transport) do
     TransportRegistry.get_channel_from_plan(
@@ -598,27 +683,61 @@ defmodule Lasso.RPC.Selection.CandidateCursor do
   defp keep_head_eligible_routes(
          descriptors,
          plan,
-         %{head_snapshot: %Lasso.Observations.HeadSnapshot{}} = filters,
+         %{head_snapshot: %HeadSnapshot{}} = filters,
          consensus_height
        ) do
-    eligible =
-      plan
-      |> CandidateListing.list_routing_candidates_from_plan(filters, consensus_height)
-      |> Enum.flat_map(fn candidate ->
-        Enum.map(candidate.transports, &{candidate.id, &1})
-      end)
-      |> MapSet.new()
+    case CandidateListing.routing_candidates_result_from_plan(
+           plan,
+           filters,
+           consensus_height,
+           nil
+         ) do
+      {:error, observed} ->
+        observations = Map.new(observed, &{&1.id, &1})
 
-    Enum.filter(descriptors, fn {provider, transport} ->
-      MapSet.member?(eligible, {provider.id, transport})
-    end)
+        rejections =
+          descriptors
+          |> Enum.take(32)
+          |> Enum.map(fn {provider, transport} ->
+            candidate = Map.fetch!(observations, provider.id)
+
+            reason =
+              if transport == :ws and transport not in candidate.transports do
+                :ws_disconnected
+              else
+                case gate_failure(
+                       filters,
+                       Map.get(candidate.circuit_state, transport),
+                       Map.get(candidate.rate_limited, transport)
+                     ) do
+                  :candidate_filtered -> :head_or_capability_filtered
+                  reason -> reason
+                end
+              end
+
+            %{provider_id: provider.id, transport: transport, reason: reason}
+          end)
+
+        {:error, rejections, length(descriptors)}
+
+      candidates ->
+        eligible =
+          candidates
+          |> Enum.flat_map(fn candidate ->
+            Enum.map(candidate.transports, &{candidate.id, &1})
+          end)
+          |> MapSet.new()
+
+        Enum.filter(descriptors, fn {provider, transport} ->
+          MapSet.member?(eligible, {provider.id, transport})
+        end)
+    end
   end
 
-  defp keep_head_eligible_routes(descriptors, _plan, _filters, _consensus_height), do: descriptors
+  defp keep_head_eligible_routes(descriptors, _plan, _filters, _snapshot), do: descriptors
 
   defp current?(cursor) do
-    Catalog.snapshot() == cursor.snapshot and
-      ConfigStore.route_generation() == cursor.snapshot.generation
+    Catalog.snapshot() == cursor.snapshot
   end
 
   defp unavailable_to_nil(:unavailable), do: nil

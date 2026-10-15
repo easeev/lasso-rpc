@@ -1147,7 +1147,7 @@ defmodule Lasso.Core.Support.CircuitBreaker do
     if generation == state.transition_generation and epoch == state.process_epoch do
       case signal do
         {:route_generation, route_generation, routed_signal} ->
-          if route_generation == ConfigStore.route_generation() do
+          if route_generation <= ConfigStore.route_generation() do
             apply_attempt_signal(state, token, generation, epoch, routed_signal)
           else
             apply_attempt_release(state, token)
@@ -1432,7 +1432,7 @@ defmodule Lasso.Core.Support.CircuitBreaker do
          generation,
          epoch
        ) do
-    if route_generation == ConfigStore.route_generation(),
+    if route_generation <= ConfigStore.route_generation(),
       do: apply_control_signal(signal, state, generation, epoch),
       else: state
   end
@@ -1866,9 +1866,12 @@ defmodule Lasso.Core.Support.CircuitBreaker do
     :ok
   end
 
+  # Receipt epoch/transition fencing binds feedback to the physical breaker.
+  # Config publication may run ahead of attempts on the coherent Catalog;
+  # their real failures and recoveries remain applicable to that instance.
   defp current_fact_generation(%{identity: %{route_generation: route_generation}})
        when is_integer(route_generation) and route_generation >= 0 do
-    if route_generation == ConfigStore.route_generation(),
+    if route_generation <= ConfigStore.route_generation(),
       do: {:ok, route_generation},
       else: :stale
   end

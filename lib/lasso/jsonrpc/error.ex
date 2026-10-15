@@ -18,7 +18,7 @@ defmodule Lasso.JSONRPC.Error do
   - `original_code` - Preserve original code before normalization
   - `source` - Where the error originated (:jsonrpc, :transport, etc.)
   - `transport` - Which transport generated this error (:http, :ws)
-  - `resolution` - Internal body-free provenance, excluded from JSON serialization
+  - `resolution` - Internal body-free classification provenance; excluded from JSON serialization
   """
 
   @derive {Jason.Encoder,
@@ -49,6 +49,8 @@ defmodule Lasso.JSONRPC.Error do
     :original_code,
     :source,
     :transport,
+    :raw_response,
+    :capacity_lease,
     :resolution
   ]
 
@@ -64,10 +66,31 @@ defmodule Lasso.JSONRPC.Error do
           retriable?: boolean() | nil,
           breaker_penalty?: boolean() | nil,
           original_code: integer() | nil,
-          source: :jsonrpc | :transport | :infrastructure | :health_check | nil,
+          source: :lasso | :jsonrpc | :transport | :infrastructure | :health_check | nil,
           transport: :http | :ws | nil,
+          raw_response: binary() | nil,
+          capacity_lease: Lasso.Core.Transport.UpstreamAdmission.Lease.t() | nil,
           resolution: ErrorResolution.t() | nil
         }
+
+  @doc "Bounded diagnostic copy; does not retain upstream bytes or own their lease."
+  def summary(%__MODULE__{} = error) do
+    message =
+      if is_binary(error.message),
+        do: bounded_message(error.message),
+        else: error.message
+
+    %{error | message: message, data: nil, raw_response: nil, capacity_lease: nil}
+  end
+
+  defp bounded_message(message) do
+    prefix = binary_part(message, 0, min(byte_size(message), 1000))
+
+    case :unicode.characters_to_binary(prefix, :utf8, :utf8) do
+      bytes when is_binary(bytes) -> :binary.copy(bytes)
+      {status, bytes, _rest} when status in [:incomplete, :error] -> :binary.copy(bytes)
+    end
+  end
 
   @doc """
   Creates a new JSON-RPC error with automatic classification.
@@ -120,6 +143,8 @@ defmodule Lasso.JSONRPC.Error do
       breaker_penalty?: breaker_penalty?,
       original_code: original_code,
       source: Keyword.get(opts, :source),
+      raw_response: Keyword.get(opts, :raw_response),
+      capacity_lease: Keyword.get(opts, :capacity_lease),
       transport: Keyword.get(opts, :transport),
       resolution: Keyword.get(opts, :resolution)
     }

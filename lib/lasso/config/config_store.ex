@@ -38,7 +38,7 @@ defmodule Lasso.Config.ConfigStore do
   alias Lasso.Config.ProfileMeta
   alias Lasso.Core.Streaming.InstanceEventBus
   alias Lasso.Core.Support.DynamicSupervisorCall
-  alias Lasso.Providers.ProviderHeaders
+  alias Lasso.Providers.{Catalog, ProviderHeaders}
   alias Lasso.RPC.ChainSupervisor
 
   @persistent_term_key :lasso_config_store_active
@@ -596,6 +596,40 @@ defmodule Lasso.Config.ConfigStore do
     GenServer.call(__MODULE__, :reload, :infinity)
   end
 
+  @doc "Warms profiles in one validated publication and repairs scoped runtime dependencies."
+  @spec ensure_profiles([map()]) :: :ok | {:error, term()}
+  def ensure_profiles(specs) when is_list(specs),
+    do: GenServer.call(__MODULE__, {:ensure_profiles, specs}, :infinity)
+
+  @doc "Checks exact published profile content without changing runtime state."
+  @spec profile_content_published?(map()) :: boolean()
+  def profile_content_published?(spec) do
+    meta = %ProfileMeta{
+      profile_id: spec.profile_id,
+      scope: spec.scope,
+      slug: spec.slug,
+      name: spec.name,
+      logo: Map.get(spec, :logo),
+      rps_limit: spec.rps_limit,
+      burst_limit: spec.burst_limit,
+      unlisted: Map.get(spec, :unlisted, false)
+    }
+
+    integer_chains = Map.new(spec.chains, fn {_alias, chain} -> {chain.chain_id, chain} end)
+
+    safe_lookup({:profile, spec.profile_id, :meta}) == [
+      {{:profile, spec.profile_id, :meta}, meta}
+    ] and
+      safe_lookup({:profile, spec.profile_id, :chains}) == [
+        {{:profile, spec.profile_id, :chains}, integer_chains}
+      ] and
+      safe_lookup({:resolve, spec.scope, spec.slug}) == [
+        {{:resolve, spec.scope, spec.slug}, spec.profile_id}
+      ]
+  rescue
+    _ -> false
+  end
+
   @doc """
   Injects a single profile into ConfigStore with full infrastructure setup.
 
@@ -700,11 +734,12 @@ defmodule Lasso.Config.ConfigStore do
     old_pairs = collect_profile_chain_pairs()
     old_chain_ids = list_chain_ids()
     old_endpoints = snapshot_all_chain_endpoints()
+    old_runtime = catalog_runtime_snapshot()
 
     case do_load_all_profiles(state, preserve_current_ets_on_degraded?: true) do
       {:ok, profiles, new_state} ->
         Logger.info("Configuration reloaded successfully")
-        publication = rebuild_shared_infrastructure(old_chain_ids)
+        publication = rebuild_shared_infrastructure(old_chain_ids, {:published, old_runtime})
         chain_results = sync_chain_supervisors(old_pairs)
         reconcile_transport_channels_all(old_endpoints)
         Enum.each(profiles, &broadcast_profile_updated/1)
@@ -722,6 +757,21 @@ defmodule Lasso.Config.ConfigStore do
         Logger.error("Failed to reload configuration: #{inspect(reason)}")
         {:reply, {:error, reason}, schedule_retry(%{state | db_degraded: true})}
     end
+  end
+
+  @impl true
+  def handle_call({:ensure_profiles, specs}, _from, state) do
+    specs = Enum.uniq_by(specs, & &1.profile_id)
+    result = do_ensure_profiles(specs)
+
+    state =
+      Enum.reduce(specs, state, fn spec, acc ->
+        if profile_content_published?(spec),
+          do: mark_runtime_dirty(acc, spec.profile_id, :ok),
+          else: acc
+      end)
+
+    {:reply, result, state}
   end
 
   @impl true
@@ -915,6 +965,7 @@ defmodule Lasso.Config.ConfigStore do
   # were injected while the Task was running.
   @impl true
   def handle_info(:retry_eager_load, state) do
+    if state.retry_timer, do: Process.cancel_timer(state.retry_timer)
     state = %{state | retry_timer: nil}
 
     if state.retry_task_ref do
@@ -1098,77 +1149,257 @@ defmodule Lasso.Config.ConfigStore do
 
   defp normalize_failure(reason), do: inspect(reason)
 
-  defp do_inject_profile(profile_spec) do
-    with :ok <- validate_profile_spec(profile_spec) do
-      do_inject_profile_validated(profile_spec)
+  defp do_ensure_profiles(specs) do
+    changed = Enum.reject(specs, &profile_content_published?/1)
+    {accepted, failures} = accepted_profile_changes(changed)
+
+    # Once the config/catalog commit succeeds, runtime reconciliation is
+    # background convergence. Verify global infrastructure and each profile's
+    # workers below instead of letting one post-commit failure gate the census.
+    runtime_specs = Enum.reject(specs, &Map.has_key?(failures, &1.profile_id))
+
+    with :ok <- census_publication_result(publish_changed_profiles(accepted)),
+         {:ok, runtime_failures} <- verify_profile_runtime(runtime_specs) do
+      failures = Map.merge(failures, runtime_failures)
+
+      if map_size(failures) == 0,
+        do: :ok,
+        else: {:error, {:profile_publication_failed, failures}}
+    end
+  rescue
+    error -> {:error, error}
+  catch
+    kind, reason -> {:error, {:runtime_unavailable, {kind, normalize_failure(reason)}}}
+  end
+
+  defp census_publication_result(:ok), do: :ok
+  defp census_publication_result({:error, {:runtime_reconcile_pending, _}}), do: :ok
+  defp census_publication_result(error), do: error
+
+  defp accepted_profile_changes([]), do: {[], %{}}
+
+  defp accepted_profile_changes(specs) do
+    # Structural failures never trigger a full catalog validation for each
+    # valid neighbour. Only shared catalog invariants need isolation.
+    {valid, structural_failures} =
+      Enum.reduce(specs, {[], %{}}, fn spec, {valid, failures} ->
+        case validate_profile_spec(spec) do
+          :ok -> {[spec | valid], failures}
+          {:error, reason} -> {valid, Map.put(failures, spec.profile_id, reason)}
+        end
+      end)
+
+    valid = Enum.reverse(valid)
+
+    validation = if valid == [], do: :ok, else: Catalog.validate_profile_batch(valid)
+
+    case validation do
+      :ok ->
+        {valid, structural_failures}
+
+      {:error, _} ->
+        Enum.reduce(valid, {[], structural_failures}, fn spec, {accepted, failures} ->
+          case Catalog.validate_profile_batch(accepted ++ [spec]) do
+            :ok ->
+              {accepted ++ [spec], failures}
+
+            {:error, reason} ->
+              Logger.error("Profile runtime publication rejected", profile_id: spec.profile_id)
+              {accepted, Map.put(failures, spec.profile_id, reason)}
+          end
+        end)
     end
   end
 
-  defp do_inject_profile_validated(profile_spec) do
-    profile_id = profile_spec.profile_id
+  defp publish_changed_profiles([]), do: :ok
 
-    Logger.info(
-      "Injecting profile into ConfigStore",
-      Lasso.Logging.profile_metadata(profile_spec)
-    )
+  defp publish_changed_profiles(specs) do
+    old_pairs = collect_profile_chain_pairs()
+    old_chain_ids = list_chain_ids()
 
-    store_profile(profile_spec)
+    old_configs =
+      Map.new(specs, fn spec ->
+        {spec.profile_id,
+         snapshot_profile_chain_configs(spec.profile_id, list_chains_for_profile(spec.profile_id))}
+      end)
 
-    update_indices_for_inject(profile_spec)
+    old_runtime = catalog_runtime_snapshot()
+    publish_profiles_upsert(specs, &Catalog.build_from_config/0)
 
-    # Inject path uses post-mutation chain_ids.
-    publication = rebuild_shared_infrastructure(list_chain_ids())
-    chain_results = start_profile_chain_supervisors(profile_id)
+    publication = rebuild_shared_infrastructure(old_chain_ids, {:published, old_runtime})
+    chains = sync_chain_supervisors(old_pairs)
+
+    transports =
+      Enum.map(specs, fn spec ->
+        result = reconcile_transport_channels(spec.profile_id, old_configs[spec.profile_id], spec)
+        if result == :ok, do: broadcast_profile_updated(spec.profile_id)
+        result
+      end)
 
     notify_inject()
-    broadcast_profile_updated(profile_id)
+    runtime_reconcile_status([publication | chains ++ transports])
+  end
 
-    runtime_reconcile_status([publication | chain_results])
+  defp catalog_coherent? do
+    case Catalog.snapshot() do
+      %{table: table, generation: generation} ->
+        Catalog.ready?() and generation == route_generation() and
+          Lasso.RPC.AttemptProjection.routes_ready?(
+            generation,
+            Catalog.routing_control_routes(table)
+          )
+
+      nil ->
+        false
+    end
+  end
+
+  defp verify_profile_runtime(specs) do
+    # Require a coherent global catalog before inspecting per-profile workers.
+    rebuild =
+      if catalog_coherent?(),
+        do: :ok,
+        else: rebuild_shared_infrastructure(list_chain_ids())
+
+    with :ok <- rebuild,
+         true <- Enum.all?(@runtime_supervisors, &is_pid(Process.whereis(&1))),
+         true <- catalog_coherent?() do
+      runtimes = Map.new(specs, &{&1.profile_id, profile_runtime([&1])})
+
+      # Shared physical workers can appear in many tenant profiles. Attempt each
+      # dependency once per census, including failures, then attribute that same
+      # result to every referencing profile instead of repeating bounded timeouts.
+      repairs =
+        runtimes
+        |> Map.values()
+        |> Enum.flat_map(&runtime_dependencies/1)
+        |> Enum.uniq()
+        |> Map.new(&{&1, repair_runtime_dependency(&1)})
+
+      failures =
+        Map.new(
+          Enum.flat_map(runtimes, fn {id, runtime} ->
+            repaired = Enum.map(runtime_dependencies(runtime), &Map.fetch!(repairs, &1))
+
+            if runtime_reconcile_status(repaired) == :ok and profile_runtime_ready?(runtime),
+              do: [],
+              else: [{id, :profile_runtime_unavailable}]
+          end)
+        )
+
+      # Transport cleanup records background convergence; it is not a worker proof.
+      runtimes
+      |> Map.values()
+      |> Enum.flat_map(& &1.profile_chains)
+      |> Enum.uniq()
+      |> reconcile_profile_channels()
+
+      if catalog_coherent?(),
+        do: {:ok, failures},
+        else: {:error, :profile_runtime_unavailable}
+    else
+      _ -> {:error, :profile_runtime_unavailable}
+    end
+  end
+
+  defp profile_runtime(specs) do
+    pairs =
+      for spec <- specs, {_alias, chain} <- spec.chains, do: {spec.profile_id, chain.chain_id}
+
+    profile_chains = Enum.uniq(pairs)
+
+    instances =
+      for {profile, chain} <- profile_chains,
+          provider <- Catalog.get_profile_providers(profile, chain),
+          instance <- [provider.instance_id],
+          do: {chain, instance}
+
+    %{
+      profile_chains: profile_chains,
+      chain_ids: pairs |> Enum.map(&elem(&1, 1)) |> Enum.uniq(),
+      instances: Enum.uniq(instances)
+    }
+  end
+
+  defp profile_runtime_ready?(runtime) do
+    Enum.all?(runtime.profile_chains, fn {profile, chain} ->
+      match?({:ok, _}, Catalog.get_routing_plan(Catalog.snapshot(), profile, chain)) and
+        Lasso.ProfileChainSupervisor.running?(profile, chain)
+    end) and
+      Enum.all?(runtime.chain_ids, fn chain ->
+        is_pid(GenServer.whereis(Lasso.Providers.ProbeCoordinator.via_name(chain)))
+      end) and
+      Enum.all?(runtime.instances, fn {_chain, instance} ->
+        is_pid(GenServer.whereis(Lasso.Providers.InstanceSupervisor.via_name(instance)))
+      end)
+  end
+
+  # Runtime-only recovery never retires instances or republishes persistent_term.
+  # A fault outside the warmed profiles is not part of this readiness decision.
+  defp runtime_dependencies(runtime) do
+    Enum.map(runtime.profile_chains, &{:profile_chain, &1}) ++
+      Enum.map(runtime.chain_ids, &{:probe, &1}) ++
+      Enum.map(runtime.instances, fn {_chain, instance} -> {:instance, instance} end)
+  end
+
+  defp repair_runtime_dependency(dependency) do
+    do_repair_runtime_dependency(dependency)
   rescue
-    e ->
-      Logger.error("Failed to inject profile: #{inspect(e)}")
-      {:error, e}
+    _error -> {:error, :profile_runtime_unavailable}
+  catch
+    _kind, _reason -> {:error, :profile_runtime_unavailable}
+  end
+
+  defp do_repair_runtime_dependency({:profile_chain, {profile, chain}}) do
+    if Lasso.ProfileChainSupervisor.running?(profile, chain) do
+      :ok
+    else
+      with {:ok, config} <- get_chain(profile, chain) do
+        Lasso.ProfileChainSupervisor.start_profile_chain(profile, chain, config)
+      end
+    end
+  end
+
+  defp do_repair_runtime_dependency({:instance, instance}) do
+    ensure_runtime_child(
+      Lasso.Providers.InstanceSupervisor.via_name(instance),
+      Lasso.Providers.InstanceDynamicSupervisor,
+      {Lasso.Providers.InstanceSupervisor, instance}
+    )
+  end
+
+  defp do_repair_runtime_dependency({:probe, chain}) do
+    ensure_runtime_child(
+      Lasso.Providers.ProbeCoordinator.via_name(chain),
+      Lasso.Providers.ProbeSupervisor,
+      {Lasso.Providers.ProbeCoordinator, chain}
+    )
+  end
+
+  defp ensure_runtime_child(name, supervisor, spec) do
+    if is_pid(GenServer.whereis(name)),
+      do: :ok,
+      else: DynamicSupervisorCall.start_child(supervisor, spec)
+  end
+
+  defp do_inject_profile(profile_spec) do
+    validate_and_publish_profile(profile_spec)
   end
 
   defp do_update_profile(profile_spec) do
-    with :ok <- validate_profile_spec(profile_spec) do
-      do_update_profile_validated(profile_spec)
+    case get_profile(profile_spec.profile_id) do
+      {:error, :not_found} -> {:error, :profile_not_found}
+      {:ok, _meta} -> validate_and_publish_profile(profile_spec)
     end
   end
 
-  defp do_update_profile_validated(profile_spec) do
-    profile_id = profile_spec.profile_id
-
-    case get_profile(profile_id) do
-      {:error, :not_found} ->
-        {:error, :profile_not_found}
-
-      {:ok, old_meta} ->
-        Logger.info(
-          "Updating profile in ConfigStore",
-          Lasso.Logging.profile_metadata(profile_spec)
-        )
-
-        old_pairs = collect_profile_chain_pairs()
-        old_chain_ids = list_chain_ids()
-        old_profile_chains = list_chains_for_profile(profile_id)
-        old_chain_configs = snapshot_profile_chain_configs(profile_id, old_profile_chains)
-
-        store_profile(profile_spec)
-        delete_stale_resolve_entry(old_meta, profile_spec)
-        rebuild_indices_for_profile(profile_id, old_profile_chains, profile_spec)
-        publication = rebuild_shared_infrastructure(old_chain_ids)
-        chain_results = sync_chain_supervisors(old_pairs)
-        reconcile_transport_channels(profile_id, old_chain_configs, profile_spec)
-        notify_inject()
-        broadcast_profile_updated(profile_id)
-
-        runtime_reconcile_status([publication | chain_results])
+  defp validate_and_publish_profile(profile_spec) do
+    with :ok <- validate_profile_spec(profile_spec),
+         :ok <- Catalog.validate_profile_batch([profile_spec]) do
+      publish_changed_profiles([profile_spec])
     end
-  rescue
-    e ->
-      Logger.error("Failed to update profile: #{inspect(e)}")
-      {:error, e}
+  catch
+    kind, reason -> {:error, {:profile_publication_failed, {kind, normalize_failure(reason)}}}
   end
 
   defp do_remove_profile(profile_id) do
@@ -1185,9 +1416,10 @@ defmodule Lasso.Config.ConfigStore do
         old_pairs = collect_profile_chain_pairs()
         old_chain_ids = list_chain_ids()
 
+        old_runtime = catalog_runtime_snapshot()
         publish_profile_removal(profile_id, meta)
 
-        publication = rebuild_shared_infrastructure(old_chain_ids)
+        publication = rebuild_shared_infrastructure(old_chain_ids, {:published, old_runtime})
         chain_results = sync_chain_supervisors(old_pairs)
         notify_inject()
         broadcast_profile_updated(profile_id)
@@ -1198,6 +1430,8 @@ defmodule Lasso.Config.ConfigStore do
     e ->
       Logger.error("Failed to remove profile: #{inspect(e)}")
       {:error, e}
+  catch
+    kind, reason -> {:error, {:profile_publication_failed, {kind, normalize_failure(reason)}}}
   end
 
   # Schedule eager-load retry and spread retries across nodes with jitter.
@@ -1236,116 +1470,42 @@ defmodule Lasso.Config.ConfigStore do
     old_pairs = collect_profile_chain_pairs()
     old_chain_ids = list_chain_ids()
 
-    changed_profile_ids =
-      Enum.flat_map(loaded_specs, fn spec ->
-        current_fingerprint = Map.get(current_fingerprints, spec.profile_id)
-        spawn_fingerprint = Map.get(spawn_snapshot, spec.profile_id)
-
-        result =
-          cond do
-            MapSet.member?(runtime_dirty_profiles, spec.profile_id) ->
-              :runtime_dirty
-
-            not MapSet.member?(current_ids, spec.profile_id) ->
-              do_inject_profile_without_rebuild(spec)
-
-            current_fingerprint == spawn_fingerprint ->
-              do_update_profile_without_rebuild(spec)
-
-            true ->
-              :unchanged_since_retry_started
-          end
-
-        case result do
-          :ok -> [spec.profile_id]
-          _ -> []
-        end
+    changed =
+      Enum.filter(loaded_specs, fn spec ->
+        not MapSet.member?(runtime_dirty_profiles, spec.profile_id) and
+          (not MapSet.member?(current_ids, spec.profile_id) or
+             Map.get(current_fingerprints, spec.profile_id) ==
+               Map.get(spawn_snapshot, spec.profile_id)) and
+          not profile_content_published?(spec)
       end)
 
-    removed_profile_ids =
-      Enum.flat_map(to_remove, fn profile_id ->
-        case do_remove_profile_without_rebuild(profile_id) do
-          :ok -> [profile_id]
-          _ -> []
-        end
-      end)
-
-    changed_ids = changed_profile_ids ++ removed_profile_ids
+    {accepted, failures} = accepted_profile_changes(changed)
+    changed_ids = Enum.map(accepted, & &1.profile_id) ++ to_remove
 
     if changed_ids != [] do
-      publication = rebuild_shared_infrastructure(old_chain_ids)
+      old_runtime = catalog_runtime_snapshot()
+      replacements = Map.new(accepted, &{&1.profile_id, &1})
+
+      specs =
+        snapshot_profile_specs()
+        |> Enum.reject(&(&1.profile_id in to_remove or Map.has_key?(replacements, &1.profile_id)))
+        |> Kernel.++(accepted)
+
+      populate_ets(specs)
+      publication = rebuild_shared_infrastructure(old_chain_ids, {:published, old_runtime})
       chain_results = sync_chain_supervisors(old_pairs)
       notify_inject()
       Enum.each(changed_ids, &broadcast_profile_updated/1)
-
       runtime_reconcile_status([publication | chain_results])
     else
-      :ok
-    end
-  end
-
-  defp do_inject_profile_without_rebuild(profile_spec) do
-    Logger.info(
-      "Injecting profile into ConfigStore",
-      Lasso.Logging.profile_metadata(profile_spec)
-    )
-
-    store_profile(profile_spec)
-    update_indices_for_inject(profile_spec)
-
-    :ok
-  rescue
-    e ->
-      Logger.error("Failed to inject profile: #{inspect(e)}")
-      {:error, e}
-  end
-
-  defp do_update_profile_without_rebuild(profile_spec) do
-    profile_id = profile_spec.profile_id
-
-    case get_profile(profile_id) do
-      {:error, :not_found} ->
-        {:error, :profile_not_found}
-
-      {:ok, old_meta} ->
-        Logger.info(
-          "Updating profile in ConfigStore",
-          Lasso.Logging.profile_metadata(profile_spec)
-        )
-
-        old_profile_chains = list_chains_for_profile(profile_id)
-
-        store_profile(profile_spec)
-        delete_stale_resolve_entry(old_meta, profile_spec)
-        rebuild_indices_for_profile(profile_id, old_profile_chains, profile_spec)
-
-        :ok
+      if map_size(failures) == 0,
+        do: :ok,
+        else: {:error, {:profile_publication_failed, failures}}
     end
   rescue
-    e ->
-      Logger.error("Failed to update profile: #{inspect(e)}")
-      {:error, e}
-  end
-
-  defp do_remove_profile_without_rebuild(profile_id) do
-    case get_profile(profile_id) do
-      {:error, :not_found} ->
-        {:error, :profile_not_found}
-
-      {:ok, meta} ->
-        Logger.info(
-          "Removing profile from ConfigStore",
-          Lasso.Logging.profile_metadata(meta)
-        )
-
-        publish_profile_removal(profile_id, meta)
-
-        :ok
-    end
-  rescue
-    e ->
-      Logger.error("Failed to remove profile: #{inspect(e)}")
-      {:error, e}
+    error -> {:error, error}
+  catch
+    kind, reason -> {:error, {:profile_publication_failed, {kind, normalize_failure(reason)}}}
   end
 
   # Set of file-backed profile IDs currently in ETS.
@@ -1422,6 +1582,10 @@ defmodule Lasso.Config.ConfigStore do
       {:error, _} = error ->
         error
     end
+  rescue
+    error -> {:error, error}
+  catch
+    kind, reason -> {:error, {:profile_publication_failed, {kind, normalize_failure(reason)}}}
   end
 
   defp finalize_load(profile_specs, state, backend_state) do
@@ -1608,11 +1772,13 @@ defmodule Lasso.Config.ConfigStore do
     build_indices(profile_specs, new_table)
 
     old_table = active_table(nil)
-    publish_snapshot(new_table, route_generation)
 
-    if old_table do
-      Owner.schedule_delete(old_table, @grace_period_ms)
-    end
+    commit =
+      if Process.whereis(Lasso.Providers.Catalog.Owner),
+        do: &Catalog.build_from_config/0,
+        else: fn -> :ok end
+
+    commit_snapshot(new_table, route_generation, old_table, commit)
   end
 
   defp safe_lookup(key) do
@@ -1678,9 +1844,8 @@ defmodule Lasso.Config.ConfigStore do
     end
   end
 
-  defp store_profile(spec), do: publish_profile_upsert(spec)
-
-  defp publish_profile_upsert(spec) do
+  defp publish_profiles_upsert(specs, commit) do
+    profile_ids = MapSet.new(specs, & &1.profile_id)
     old_table = table()
     route_generation = next_route_generation()
 
@@ -1695,9 +1860,9 @@ defmodule Lasso.Config.ConfigStore do
     old_table
     |> :ets.tab2list()
     |> Enum.reject(fn
-      {{:profile, profile_id, :meta}, _} -> profile_id == spec.profile_id
-      {{:profile, profile_id, :chains}, _} -> profile_id == spec.profile_id
-      {{:resolve, _scope, _slug}, profile_id} -> profile_id == spec.profile_id
+      {{:profile, profile_id, :meta}, _} -> MapSet.member?(profile_ids, profile_id)
+      {{:profile, profile_id, :chains}, _} -> MapSet.member?(profile_ids, profile_id)
+      {{:resolve, _scope, _slug}, profile_id} -> MapSet.member?(profile_ids, profile_id)
       {{:profile_list}, _} -> true
       {{:chain_profiles, _chain_id}, _} -> true
       {{:all_chain_ids}, _} -> true
@@ -1705,14 +1870,44 @@ defmodule Lasso.Config.ConfigStore do
     end)
     |> then(&:ets.insert(new_table, &1))
 
-    store_profile(spec, new_table)
+    Enum.each(specs, &store_profile(&1, new_table))
     :ets.insert(new_table, {{:route_generation}, route_generation})
     rebuild_indices_from_table(new_table)
 
-    publish_snapshot(new_table, route_generation)
-    Owner.schedule_delete(old_table, @grace_period_ms)
-
+    commit_snapshot(new_table, route_generation, old_table, commit)
     :ok
+  end
+
+  defp commit_snapshot(new_table, generation, old_table, commit) do
+    old_generation = route_generation()
+    publish_snapshot(new_table, generation)
+
+    try do
+      :ok = commit.()
+      if old_table, do: Owner.schedule_delete(old_table, @grace_period_ms)
+    catch
+      kind, reason ->
+        stacktrace = __STACKTRACE__
+        publish_snapshot(old_table, old_generation)
+        Owner.schedule_delete(new_table, @grace_period_ms)
+        restore_catalog_controls()
+        :erlang.raise(kind, reason, stacktrace)
+    end
+  end
+
+  defp restore_catalog_controls do
+    case Catalog.snapshot() do
+      %{table: table, generation: generation} ->
+        if :ets.info(table, :size) != :undefined do
+          Lasso.RPC.AttemptProjection.reconcile_routes(
+            generation,
+            Catalog.routing_control_routes(table)
+          )
+        end
+
+      nil ->
+        :ok
+    end
   end
 
   defp store_profile(spec, t) do
@@ -1746,11 +1941,6 @@ defmodule Lasso.Config.ConfigStore do
     ])
   end
 
-  # When `update_profile` reshapes a profile under a new scope or slug,
-  # `store_profile/2` writes the new `{:resolve, scope, slug}` entry but
-  # leaves the prior one pointing at the same `profile_id`. That stale
-  # entry would let `resolve(old_scope, old_slug)` keep returning the
-  # profile after rename. Drop it.
   defp publish_profile_removal(profile_id, %ProfileMeta{} = meta) do
     old_table = table()
     route_generation = next_route_generation()
@@ -1780,8 +1970,7 @@ defmodule Lasso.Config.ConfigStore do
     :ets.insert(new_table, {{:route_generation}, route_generation})
     rebuild_indices_from_table(new_table)
 
-    publish_snapshot(new_table, route_generation)
-    Owner.schedule_delete(old_table, @grace_period_ms)
+    commit_snapshot(new_table, route_generation, old_table, &Catalog.build_from_config/0)
 
     :ok
   end
@@ -1810,8 +1999,6 @@ defmodule Lasso.Config.ConfigStore do
       :ets.insert(t, {{:chain_profiles, chain_id}, Enum.uniq(profile_ids)})
     end)
   end
-
-  defp delete_stale_resolve_entry(%ProfileMeta{}, _new_spec), do: :ok
 
   defp build_indices(profile_specs, t) do
     profile_ids = Enum.map(profile_specs, & &1.profile_id)
@@ -2011,7 +2198,6 @@ defmodule Lasso.Config.ConfigStore do
   end
 
   # Profile publication rebuilds all indices in the unpublished snapshot.
-  defp update_indices_for_inject(_spec), do: :ok
 
   defp notify_inject do
     case Application.get_env(:lasso, :profile_inject_listener) do
@@ -2304,9 +2490,6 @@ defmodule Lasso.Config.ConfigStore do
     end
   end
 
-  # `publish_profile_upsert/1` atomically publishes the complete rebuilt index.
-  defp rebuild_indices_for_profile(_profile_id, _old_chain_ids, _profile_spec), do: :ok
-
   # Reconciles Catalog + InstanceSupervisors + ProbeCoordinators + BlockSync
   # workers against current ConfigStore state.
   #
@@ -2319,13 +2502,19 @@ defmodule Lasso.Config.ConfigStore do
   #     list — equivalent to the pre-mutation set plus the just-added chains).
   #   - Update / remove / reload paths: pass the chain list captured BEFORE
   #     the mutation so removed chains tear down cleanly.
-  defp rebuild_shared_infrastructure(old_chain_ids) do
-    alias Lasso.Providers.Catalog
+  defp catalog_runtime_snapshot do
+    instances = Catalog.list_all_instance_ids()
+    {instances, snapshot_instance_chain_ids(instances)}
+  end
 
-    old_instances = Catalog.list_all_instance_ids()
-    old_instance_chain_ids = snapshot_instance_chain_ids(old_instances)
+  defp rebuild_shared_infrastructure(old_chain_ids, publication \\ :rebuild) do
+    {old_instances, old_instance_chain_ids} =
+      case publication do
+        {:published, previous} -> previous
+        :rebuild -> catalog_runtime_snapshot()
+      end
 
-    Catalog.build_from_config()
+    if publication == :rebuild, do: Catalog.build_from_config()
 
     new_instances = Catalog.list_all_instance_ids()
     new_chain_ids = list_chain_ids()
@@ -2594,6 +2783,19 @@ defmodule Lasso.Config.ConfigStore do
   end
 
   defp track_runtime_reconcile_result(result, _operation), do: result
+
+  defp reconcile_profile_channels(profile_chains) do
+    pairs = MapSet.new(profile_chains)
+
+    @pending_cleanup_table
+    |> :ets.tab2list()
+    |> Enum.flat_map(fn {{profile, chain, _provider} = key, pending} ->
+      if MapSet.member?(pairs, {profile, chain}),
+        do: [reconcile_provider_cleanup(key, pending)],
+        else: []
+    end)
+    |> runtime_reconcile_status()
+  end
 
   defp reconcile_pending_provider_cleanup do
     @pending_cleanup_table

@@ -136,6 +136,11 @@ defmodule Lasso.Core.Transport.UpstreamAdmission do
     )
   end
 
+  @doc "Charges additional retained representations without counting them as new wire bytes."
+  @spec reserve_retention(Lease.t(), non_neg_integer()) :: :ok | {:error, rejection()}
+  def reserve_retention(%Lease{} = lease, bytes) when is_integer(bytes) and bytes >= 0,
+    do: call_lease(lease, {:reserve_response, lease.token, 0, bytes})
+
   @spec reject_response(Lease.t(), atom()) :: :ok | {:error, rejection()}
   def reject_response(%Lease{} = lease, reason) when is_atom(reason) do
     call_lease(lease, {:reject_response, lease.token, reason})

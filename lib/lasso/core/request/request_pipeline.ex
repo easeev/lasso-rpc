@@ -21,7 +21,8 @@ defmodule Lasso.RPC.RequestPipeline do
 
   require Logger
 
-  alias Lasso.Config.{ConfigStore, MethodConstraints, ProfileValidator}
+  alias Lasso.RPC.Response.Capacity
+  alias Lasso.Config.{MethodConstraints, ProfileValidator}
   alias Lasso.Core.Request.{ExecutionScope, RequestOwner}
   alias Lasso.Core.Support.CircuitBreaker
   alias Lasso.Core.Support.CircuitBreaker.AdmissionReceipt
@@ -300,7 +301,7 @@ defmodule Lasso.RPC.RequestPipeline do
         :ok ->
           case selected do
             nil ->
-              handle_no_channels(ctx, selection_exhaustion_reason(candidates))
+              handle_no_channels(ctx, selection_exhaustion_reason(remaining), remaining)
 
             %Channel{} = channel ->
               ctx = RequestContext.mark_upstream_start(ctx)
@@ -420,7 +421,7 @@ defmodule Lasso.RPC.RequestPipeline do
   end
 
   defp do_attempt_channels(%CandidateCursor{} = cursor, ctx, param_rejected, caller_guard) do
-    case CandidateCursor.next(cursor) do
+    case CandidateCursor.next_with_evidence(cursor) do
       {:ok, channel, rest} ->
         do_attempt_channels(
           [channel],
@@ -430,7 +431,7 @@ defmodule Lasso.RPC.RequestPipeline do
           rest
         )
 
-      result when result in [:done, :stale] ->
+      {result, _remaining} when result in [:done, :stale] ->
         do_attempt_channels([], ctx, param_rejected, caller_guard)
     end
   end
@@ -516,9 +517,9 @@ defmodule Lasso.RPC.RequestPipeline do
   defp pop_candidate([]), do: {nil, []}
 
   defp pop_candidate(%CandidateCursor{} = cursor) do
-    case CandidateCursor.next(cursor) do
+    case CandidateCursor.next_with_evidence(cursor) do
       {:ok, channel, remaining} -> {channel, remaining}
-      result when result in [:done, :stale] -> {nil, []}
+      {result, remaining} when result in [:done, :stale] -> {nil, remaining}
     end
   end
 
@@ -811,6 +812,8 @@ defmodule Lasso.RPC.RequestPipeline do
        ) do
     timeout_ms = max(div(attempt_deadline_us - System.monotonic_time(:microsecond), 1_000), 1)
 
+    ctx = retire_last_error(ctx, :retry_started)
+
     outcome =
       Lasso.Observability.Tracing.attempt(channel, ctx, fn ->
         RequestOwner.execute(
@@ -837,7 +840,9 @@ defmodule Lasso.RPC.RequestPipeline do
 
     _projection_result =
       AttemptProjection.process(
-        AttemptProjection.new(outcome.fact, channel.provider_id, ctx.method, qualification)
+        AttemptProjection.new(outcome.fact, channel.provider_id, ctx.method, qualification),
+        Lasso.Core.ProjectionDispatcher,
+        identity.upstream_instance_id
       )
 
     ctx = commit_attempt_context(ctx, channel, identity.upstream_instance_id, outcome)
@@ -1280,8 +1285,9 @@ defmodule Lasso.RPC.RequestPipeline do
 
   defp selection_exhaustion_reason(_candidates), do: :no_eligible_providers
 
-  @spec handle_no_channels(RequestContext.t(), atom()) :: result()
-  defp handle_no_channels(ctx, reason) do
+  @spec handle_no_channels(RequestContext.t(), atom(), candidates()) :: result()
+  defp handle_no_channels(ctx, reason, candidates) do
+    Lasso.RPC.Selection.Exhaustion.record(ctx, candidates, reason)
     profile = if ctx.opts, do: ctx.opts.profile, else: ProfileValidator.default_profile()
 
     retry_after_ms =
@@ -1339,8 +1345,25 @@ defmodule Lasso.RPC.RequestPipeline do
     end
   end
 
+  defp retire_last_error(%{last_attempt_error: %JError{} = error} = ctx, reason) do
+    %{ctx | last_attempt_error: Capacity.discard(error, reason)}
+  end
+
+  defp retire_last_error(ctx, _reason), do: ctx
+
   @spec finalize_error(JError.t(), RequestContext.t()) :: result()
   defp finalize_error(jerr, ctx) do
+    previous = ctx.last_attempt_error
+
+    if Capacity.lease(previous) != Capacity.lease(jerr),
+      do: Capacity.release(previous, :translated_or_replaced)
+
+    ctx = %{
+      ctx
+      | last_attempt_error:
+          if(match?(%JError{}, previous), do: JError.summary(previous), else: previous)
+    }
+
     ctx =
       ctx
       |> RequestContext.mark_upstream_end()
@@ -1362,7 +1385,7 @@ defmodule Lasso.RPC.RequestPipeline do
 
   defp request_open(ctx, caller_guard) do
     cond do
-      not ExecutionScope.caller_alive?(caller_guard) ->
+      RequestOwner.shutdown_requested?() or not ExecutionScope.caller_alive?(caller_guard) ->
         {:error, :caller_abandoned}
 
       System.monotonic_time(:microsecond) >= ctx.execution_envelope.deadline_us ->
@@ -1471,9 +1494,10 @@ defmodule Lasso.RPC.RequestPipeline do
         _status,
         _value,
         %RequestContext{
-          terminal_attempt_fact: %AttemptTerminal.Cancelled{reason: :caller_abandoned}
+          terminal_attempt_fact: %AttemptTerminal.Cancelled{reason: reason}
         } = ctx
-      ) do
+      )
+      when reason in [:caller_abandoned, :owner_shutdown] do
     RequestTerminal.CallerAbandonment.new(
       request_terminal_attrs(ctx),
       ctx.request_dispatch_certainty
@@ -1623,6 +1647,11 @@ defmodule Lasso.RPC.RequestPipeline do
         params: [],
         rpc_request: nil,
         prepared_request: nil,
+        last_attempt_error:
+          if(match?(%JError{}, ctx.last_attempt_error),
+            do: JError.summary(ctx.last_attempt_error),
+            else: ctx.last_attempt_error
+          ),
         opts: opts
     }
   end
@@ -1707,10 +1736,9 @@ defmodule Lasso.RPC.RequestPipeline do
               not is_nil(channel),
               do: channel
 
-        if Catalog.snapshot() == snapshot and
-             ConfigStore.route_generation() == snapshot.generation,
-           do: channels,
-           else: []
+        if Catalog.snapshot() == snapshot,
+          do: channels,
+          else: []
 
       _unavailable ->
         []
@@ -1730,12 +1758,11 @@ defmodule Lasso.RPC.RequestPipeline do
 
   defp active_catalog_provider(profile, chain_id, provider_id) do
     with %{generation: generation} = snapshot <- Catalog.snapshot(),
-         true <- generation == ConfigStore.route_generation(),
-         {:ok, plan} <- Catalog.get_routing_plan(snapshot, profile, chain_id),
+         {:ok, %Lasso.RPC.RoutingPlan{generation: ^generation} = plan} <-
+           Catalog.get_routing_plan(snapshot, profile, chain_id),
          provider when not is_nil(provider) <-
            Enum.find(plan.providers, &(&1.id == provider_id)),
-         true <- Catalog.snapshot() == snapshot,
-         true <- ConfigStore.route_generation() == generation do
+         true <- Catalog.snapshot() == snapshot do
       {:ok, snapshot, provider, provider.config}
     else
       _unavailable -> {:error, :not_found}

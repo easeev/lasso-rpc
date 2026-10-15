@@ -127,6 +127,36 @@ defmodule Lasso.Config.ConfigStoreSupervisorRecoveryTest do
     )
   end
 
+  test "batch warming publishes once, rejects malformed neighbors and repairs without republishing" do
+    {first, chain, _provider} = profile_spec()
+    {second, _, _} = profile_spec()
+    invalid = %{second | profile_id: second.profile_id <> "-invalid", scope: :unsupported}
+
+    on_exit(fn ->
+      for spec <- [first, second], do: ConfigStore.remove_profile(spec.profile_id)
+    end)
+
+    before_generation = ConfigStore.route_generation()
+
+    assert {:error, {:profile_publication_failed, failures}} =
+             ConfigStore.ensure_profiles([first, invalid, second])
+
+    assert Map.has_key?(failures, invalid.profile_id)
+    assert ConfigStore.route_generation() == before_generation + 1
+    assert Catalog.active_generation() == ConfigStore.route_generation()
+    snapshot = Catalog.snapshot()
+    config = :persistent_term.get(:lasso_config_store_active)
+    assert :ok = ConfigStore.ensure_profiles([first, second])
+    assert Catalog.snapshot() == snapshot
+    assert :persistent_term.get(:lasso_config_store_active) == config
+    assert :ok = Lasso.ProfileChainSupervisor.stop_profile_chain(first.profile_id, chain)
+    refute Lasso.ProfileChainSupervisor.running?(first.profile_id, chain)
+    assert :ok = ConfigStore.ensure_profiles([first, second])
+    assert Lasso.ProfileChainSupervisor.running?(first.profile_id, chain)
+    assert Catalog.snapshot() == snapshot
+    assert :persistent_term.get(:lasso_config_store_active) == config
+  end
+
   defp profile_spec do
     suffix = System.unique_integer([:positive])
     profile_id = "runtime-reconcile-#{suffix}"

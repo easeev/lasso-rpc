@@ -329,7 +329,7 @@ defmodule Lasso.Providers.CandidateListingTest do
         :ets.lookup(:lasso_instance_state, {:routing_control_scope, @profile, @chain})
 
       assert tombstone.generation == active.generation
-      assert tombstone.publication_loss_generation == generation_two
+      assert tombstone.publication_loss_generation == nil
 
       continue_publication(ref, :after_catalog_populate)
       assert_publication_phase(ref, :after_catalog_populate, generation_two)
@@ -352,9 +352,9 @@ defmodule Lasso.Providers.CandidateListingTest do
       assert_publication_phase(ref, :after_control_populate, generation_two)
 
       scope = AttemptProjection.scope_state(@profile, @chain, generation_two)
-      assert scope.degraded?
-      assert scope.publication_loss_generation == generation_two
-      assert scope.stale_drops >= 1
+      refute scope.degraded?
+      assert scope.publication_loss_generation == nil
+      assert scope.stale_drops == 0
 
       continue_publication(ref, :after_control_populate)
       assert_publication_phase(ref, :before_pointer_swap, generation_two)
@@ -369,7 +369,6 @@ defmodule Lasso.Providers.CandidateListingTest do
     end
 
     test "a loss tombstone survives a superseded prepared generation" do
-      active_generation = Catalog.active_generation()
       instance_id = Catalog.lookup_instance_id(@profile, @chain, "p1")
 
       assert :ok =
@@ -399,7 +398,7 @@ defmodule Lasso.Providers.CandidateListingTest do
 
       stale_fact =
         AttemptTerminal.Response.new(
-          attempt_identity(instance_id, active_generation),
+          attempt_identity(instance_id, generation_one + 1),
           :success,
           10
         )
@@ -505,8 +504,8 @@ defmodule Lasso.Providers.CandidateListingTest do
 
       assert :ok = Catalog.build_from_config()
       scope = AttemptProjection.scope_state(@profile, @chain, next_generation)
-      assert scope.degraded?
-      assert scope.stale_drops >= 1
+      refute scope.degraded?
+      assert scope.stale_drops == 0
 
       key = {:routing_control, @profile, @chain, instance_id, :http, "client"}
       [{^key, row}] = :ets.lookup(:lasso_instance_state, key)

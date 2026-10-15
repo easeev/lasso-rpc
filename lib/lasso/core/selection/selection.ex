@@ -17,7 +17,6 @@ defmodule Lasso.RPC.Selection do
 
   require Logger
 
-  alias Lasso.Config.ConfigStore
   alias Lasso.Observations.HeadSnapshot
   alias Lasso.Providers.{CandidateListing, Catalog, HeadEvidence}
 
@@ -1086,22 +1085,17 @@ defmodule Lasso.RPC.Selection do
   defp capture_selection_snapshot(profile, chain_id) do
     case Catalog.snapshot() do
       %{generation: generation} = snapshot ->
-        with true <- ConfigStore.route_generation() == generation,
-             {:ok, plan} <- Catalog.get_routing_plan(snapshot, profile, chain_id) do
-          {:ok, snapshot, plan}
-        else
-          _unavailable -> :unavailable
+        case Catalog.get_routing_plan(snapshot, profile, chain_id) do
+          {:ok, %RoutingPlan{generation: ^generation} = plan} -> {:ok, snapshot, plan}
+          _ -> :unavailable
         end
 
-      _unavailable ->
+      _ ->
         :unavailable
     end
   end
 
-  defp selection_snapshot_current?(snapshot),
-    do:
-      Catalog.snapshot() == snapshot and
-        ConfigStore.route_generation() == snapshot.generation
+  defp selection_snapshot_current?(snapshot), do: Catalog.snapshot() == snapshot
 
   defp selection_snapshot_current?(snapshot, candidates) do
     Enum.all?(candidates, &(&1.route_generation == snapshot.generation)) and

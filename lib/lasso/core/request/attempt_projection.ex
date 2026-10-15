@@ -3,6 +3,7 @@ defmodule Lasso.RPC.AttemptProjection do
 
   alias Lasso.Config.ConfigStore
   alias Lasso.Core.ProjectionDispatcher
+  alias Lasso.Providers.InstanceState
 
   alias Lasso.RPC.{
     AttemptTerminal,
@@ -86,16 +87,17 @@ defmodule Lasso.RPC.AttemptProjection do
     |> validate!()
   end
 
-  @spec process(t(), atom()) :: {atom(), term()}
-  def process(%__MODULE__{} = event, dispatcher \\ @dispatcher) when is_atom(dispatcher) do
-    control_result = apply_control(event)
+  @spec process(t(), atom(), binary() | nil) :: {atom(), term()}
+  def process(%__MODULE__{} = event, dispatcher \\ @dispatcher, instance_id \\ nil)
+      when is_atom(dispatcher) do
+    control_result = apply_control(event, nil, instance_id)
     diagnostic_result = enqueue_diagnostic(event, dispatcher)
     {control_result, diagnostic_result}
   end
 
   @spec apply_control(t()) :: :ok | :not_dispatched | :stale | :degraded
   def apply_control(%__MODULE__{} = event) do
-    apply_control(event, nil)
+    apply_control(event, nil, nil)
   end
 
   @doc "Applies control evidence after a deterministic test barrier is released."
@@ -103,14 +105,26 @@ defmodule Lasso.RPC.AttemptProjection do
           :ok | :not_dispatched | :stale | :degraded
   def apply_control_after_barrier(%__MODULE__{} = event, observer, release_ref)
       when is_pid(observer) and is_reference(release_ref) do
-    apply_control(event, {observer, release_ref})
+    apply_control(event, {observer, release_ref}, nil)
   end
 
-  defp apply_control(event, barrier) do
+  defp apply_control(event, barrier, instance_id) do
     identity = identity(event.fact)
     generation = ConfigStore.route_generation()
     workload = Workload.decode(identity.workload_key)
     delta = control_delta(event)
+
+    # Quota is a physical-instance fact, not replacement-generation learning.
+    # Record it before the generation fence, including a concurrent config flip.
+    if delta.kind == :rate_limit and workload != :unknown and
+         identity.route_generation <= generation do
+      InstanceState.record_rate_limit(
+        instance_id || identity.upstream_instance_id,
+        identity.transport,
+        max(delta.retry_after_ms, 1),
+        identity.circuit_epoch
+      )
+    end
 
     cond do
       identity.route_generation != generation ->
@@ -1160,15 +1174,20 @@ defmodule Lasso.RPC.AttemptProjection do
   end
 
   defp record_stale(identity, current_generation, emitted_at_us) do
-    degrade_scope_key(
-      scope_key(identity.profile, identity.chain_id),
-      current_generation,
-      emitted_at_us,
-      :stale_drops,
-      @control_retries
-    )
+    # Older dispatched facts are valid instance observations. They must not
+    # degrade the replacement generation while its Catalog is being built.
+    if identity.route_generation >= current_generation do
+      degrade_scope_key(
+        scope_key(identity.profile, identity.chain_id),
+        current_generation,
+        emitted_at_us,
+        :stale_drops,
+        @control_retries
+      )
 
-    update_counter(route_key(identity), current_generation, :stale_drops, @control_retries)
+      update_counter(route_key(identity), current_generation, :stale_drops, @control_retries)
+    end
+
     :ok
   end
 

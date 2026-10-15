@@ -2,6 +2,7 @@ defmodule LassoWeb.RPCController.BatchExecutor do
   @moduledoc false
 
   alias Lasso.Core.Request.ExecutionScope
+  alias Lasso.RPC.Response.Capacity
 
   @default_max_active 4
   @retained_item_keys [:index, :request_id, :respond?]
@@ -75,6 +76,17 @@ defmodule LassoWeb.RPCController.BatchExecutor do
     child = fn ->
       scope = ExecutionScope.monitored(self(), parent, item.deadline_us)
       result = executor.(item, scope)
+
+      result =
+        case Capacity.transfer(result, parent) do
+          :ok ->
+            result
+
+          {:error, _} ->
+            Capacity.release(result, :handoff_failed)
+            {:error, :response_handoff_failed}
+        end
+
       send(parent, {:batch_item_result, item_ref, self(), result})
     end
 
@@ -125,6 +137,8 @@ defmodule LassoWeb.RPCController.BatchExecutor do
             |> await_items()
 
           _other ->
+            Capacity.release(result, :stale_batch_result)
+
             state
             |> update_counter(:stale_result)
             |> await_items()

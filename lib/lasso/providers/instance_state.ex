@@ -1,6 +1,6 @@
 defmodule Lasso.Providers.InstanceState do
   @moduledoc """
-  Centralized ETS reads for shared instance state (`lasso_instance_state`).
+  Centralized ETS access for shared instance state (`lasso_instance_state`).
 
   All health, circuit breaker, and rate limit state for provider instances
   is stored in a single ETS table. This module provides the canonical read
@@ -68,7 +68,7 @@ defmodule Lasso.Providers.InstanceState do
     merge_health(probe, block_sync, routing)
   end
 
-  @doc false
+  @doc "Reads base and per-transport health for a routing candidate."
   @spec read_candidate_health(String.t(), map() | nil, map() | nil, boolean()) :: %{
           base: map(),
           http: map(),
@@ -198,20 +198,22 @@ defmodule Lasso.Providers.InstanceState do
     ArgumentError -> @default_circuit
   end
 
-  @doc false
+  @doc "Reads compact circuit and rate-limit state for one candidate transport."
   @spec read_candidate_gate(String.t(), :http | :ws, map() | nil, boolean()) ::
           {atom(), boolean()}
   def read_candidate_gate(instance_id, transport, routing_state, include_learned?)
       when is_binary(instance_id) and transport in [:http, :ws] and
              is_boolean(include_learned?) do
+    circuit = live_circuit_snapshot(instance_id, transport)
+
     circuit_state =
-      case live_circuit_snapshot(instance_id, transport) do
+      case circuit do
         {:ok, snapshot} -> effective_circuit_state(snapshot)
         :unavailable -> :unavailable
       end
 
     {circuit_state,
-     candidate_rate_limited?(instance_id, transport, routing_state, include_learned?)}
+     candidate_rate_limited?(instance_id, transport, routing_state, include_learned?, circuit)}
   rescue
     ArgumentError -> {:unavailable, false}
   end
@@ -229,7 +231,7 @@ defmodule Lasso.Providers.InstanceState do
   defp effective_circuit_state(%{control_health: :degraded}), do: :half_open
   defp effective_circuit_state(snapshot), do: snapshot.state
 
-  defp candidate_rate_limited?(instance_id, transport, routing_state, include_learned?) do
+  defp candidate_rate_limited?(instance_id, transport, routing_state, include_learned?, circuit) do
     now_ms = System.monotonic_time(:millisecond)
 
     learned_limited? =
@@ -245,8 +247,11 @@ defmodule Lasso.Providers.InstanceState do
 
     local_limited? =
       case safe_lookup({:rate_limit, instance_id, transport}) do
-        [{_, %{expiry_ms: expiry}}] when active_rate_limit?(expiry, now_ms) -> true
-        _other -> false
+        [{_, %{expiry_ms: expiry} = cooldown}] when active_rate_limit?(expiry, now_ms) ->
+          current_cooldown?(cooldown, circuit)
+
+        _other ->
+          false
       end
 
     learned_limited? or local_limited?
@@ -286,9 +291,11 @@ defmodule Lasso.Providers.InstanceState do
       |> Enum.flat_map(fn {key, learned?} ->
         case safe_lookup(key) do
           [{_, %{expiry_ms: expiry} = data}] when active_rate_limit?(expiry, now_ms) ->
-            if not learned? or fresh_learned?(data, Keyword.get(opts, :learned_floor_us)),
-              do: [expiry],
-              else: []
+            if (not learned? and
+                  current_local_cooldown?(data, instance_id, transport)) or
+                 (learned? and fresh_learned?(data, Keyword.get(opts, :learned_floor_us))),
+               do: [expiry],
+               else: []
 
           _other ->
             []
@@ -306,28 +313,85 @@ defmodule Lasso.Providers.InstanceState do
     end
   end
 
-  @doc "Records a local transport cooldown without shortening an active one."
+  @doc "Records a bounded local transport cooldown without shortening an active cooldown."
   @spec record_rate_limit(String.t(), :http | :ws, pos_integer()) :: :ok
   def record_rate_limit(instance_id, transport, ttl_ms)
       when is_binary(instance_id) and transport in [:http, :ws] and is_integer(ttl_ms) and
              ttl_ms > 0 do
     expiry_ms = System.monotonic_time(:millisecond) + ttl_ms
     key = {:rate_limit, instance_id, transport}
-    put_longer_rate_limit(key, %{expiry_ms: expiry_ms, retry_after_ms: ttl_ms})
+    cooldown = %{expiry_ms: expiry_ms, retry_after_ms: ttl_ms}
+
+    cooldown =
+      case local_circuit_epoch(instance_id, transport) do
+        nil -> cooldown
+        epoch -> Map.put(cooldown, :circuit_epoch, epoch)
+      end
+
+    put_longer_rate_limit(key, cooldown)
   end
+
+  @doc "Records quota feedback only for the originating physical breaker lifetime."
+  @spec record_rate_limit(String.t(), :http | :ws, pos_integer(), non_neg_integer()) :: :ok
+  def record_rate_limit(instance_id, transport, ttl_ms, epoch)
+      when is_binary(instance_id) and transport in [:http, :ws] and is_integer(ttl_ms) and
+             ttl_ms > 0 and is_integer(epoch) and epoch >= 0 do
+    case Snapshot.lookup({instance_id, transport}) do
+      {:ok, %{epoch: ^epoch, owner_pid: owner}} when is_pid(owner) ->
+        if Process.alive?(owner) do
+          put_longer_rate_limit({:rate_limit, instance_id, transport}, %{
+            expiry_ms: System.monotonic_time(:millisecond) + ttl_ms,
+            retry_after_ms: ttl_ms,
+            circuit_epoch: epoch
+          })
+        else
+          :ok
+        end
+
+      _retired ->
+        :ok
+    end
+  end
+
+  defp local_circuit_epoch(instance_id, transport) do
+    case Snapshot.lookup({instance_id, transport}) do
+      {:ok, %{epoch: epoch}} -> epoch
+      _missing -> nil
+    end
+  rescue
+    ArgumentError -> nil
+  end
+
+  defp current_local_cooldown?(%{circuit_epoch: _} = cooldown, instance_id, transport),
+    do: current_cooldown?(cooldown, Snapshot.lookup({instance_id, transport}))
+
+  defp current_local_cooldown?(_unscoped, _instance_id, _transport), do: true
+
+  defp current_cooldown?(%{circuit_epoch: epoch}, {:ok, %{epoch: epoch}}), do: true
+  defp current_cooldown?(%{circuit_epoch: _epoch}, _circuit), do: false
+  defp current_cooldown?(_unscoped, _circuit), do: true
 
   defp put_longer_rate_limit(key, %{expiry_ms: expiry_ms} = cooldown) do
     case safe_lookup(key) do
-      [{^key, %{expiry_ms: existing_expiry}}] when existing_expiry >= expiry_ms ->
-        :ok
+      [{^key, %{expiry_ms: existing_expiry} = existing}] ->
+        existing_epoch = Map.get(existing, :circuit_epoch)
+        epoch = Map.get(cooldown, :circuit_epoch)
 
-      [{^key, existing}] ->
-        case :ets.select_replace(
-               :lasso_instance_state,
-               [{{key, existing}, [], [{:const, {key, cooldown}}]}]
-             ) do
-          1 -> :ok
-          0 -> put_longer_rate_limit(key, cooldown)
+        same_lifetime? = is_nil(existing_epoch) or is_nil(epoch) or existing_epoch == epoch
+
+        newer_lifetime? =
+          is_integer(existing_epoch) and is_integer(epoch) and existing_epoch > epoch
+
+        if newer_lifetime? or (same_lifetime? and existing_expiry >= expiry_ms) do
+          :ok
+        else
+          case :ets.select_replace(
+                 :lasso_instance_state,
+                 [{{key, existing}, [], [{:const, {key, cooldown}}]}]
+               ) do
+            1 -> :ok
+            0 -> put_longer_rate_limit(key, cooldown)
+          end
         end
 
       [] ->

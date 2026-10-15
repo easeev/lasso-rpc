@@ -41,10 +41,13 @@ defmodule Lasso.Observability.PrometheusMetrics do
     event_buffer_overflow event_too_large invalid_header invalid_log stale_provider
     message_limit mailbox_limit owner_messages owner_bytes node_capacity contention recipient_down
     released active recovered
-    critical warning available unavailable not_found)
+    critical warning available unavailable not_found
+    routing_configuration_changed no_providers_configured providers_excluded
+    transport_unavailable archive_required no_eligible_providers)
 
   @route_labels [:profile, :chain, :provider, :method, :transport, :origin, :outcome]
   @definitions [
+    {"lasso_routing_selection_exhausted_total", :counter, "Exhausted routing selection phases"},
     {"lasso_rpc_request_duration_seconds", :histogram,
      "Routed completion duration, including failovers"},
     {"lasso_upstream_attempts_total", :counter,
@@ -72,6 +75,7 @@ defmodule Lasso.Observability.PrometheusMetrics do
      "Managed upstream credential health transitions"}
   ]
   @events [
+    [:lasso, :routing, :selection_exhausted],
     [:lasso, :rpc, :request, :stop],
     [:lasso, :rpc, :attempt, :terminal],
     [:lasso, :circuit_breaker, :open],
@@ -151,6 +155,10 @@ defmodule Lasso.Observability.PrometheusMetrics do
     _kind, _reason ->
       count_invalid()
       :ok
+  end
+
+  defp observe([:lasso, :routing, :selection_exhausted], _ms, meta) do
+    counter("lasso_routing_selection_exhausted_total", reason: enum(meta[:reason]))
   end
 
   defp observe([:lasso, :rpc, :request, :stop], ms, meta) do

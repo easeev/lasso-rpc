@@ -71,27 +71,52 @@ defmodule Lasso.Providers.Catalog do
   """
   @spec populate(:ets.tid(), non_neg_integer()) :: :ok
   def populate(new_table, generation) when is_integer(generation) and generation >= 0 do
-    profiles = ConfigStore.list_profiles()
+    populate_profiles(new_table, generation, configured_profiles())
+  end
 
+  @doc "Validates candidate profiles without changing the published catalog or control rows."
+  @spec validate_profile_batch([map()]) :: :ok | {:error, term()}
+  def validate_profile_batch(specs) do
+    candidate = :ets.new(:lasso_catalog_validation, [:private, :set])
+
+    try do
+      overrides =
+        Map.new(specs, fn spec ->
+          {spec.profile_id,
+           Map.new(spec.chains, fn {_alias, chain} -> {chain.chain_id, chain} end)}
+        end)
+
+      populate_profiles(
+        candidate,
+        ConfigStore.route_generation() + 1,
+        Map.merge(configured_profiles(), overrides)
+      )
+    rescue
+      error -> {:error, {error.__struct__, Exception.message(error)}}
+    catch
+      kind, _reason -> {:error, {:catalog_build_failed, kind}}
+    after
+      :ets.delete(candidate)
+    end
+  end
+
+  defp configured_profiles do
+    Map.new(ConfigStore.list_profiles(), fn profile ->
+      chains =
+        case ConfigStore.get_profile_chains(profile) do
+          {:ok, chains} -> chains
+          _ -> %{}
+        end
+
+      {profile, chains}
+    end)
+  end
+
+  defp populate_profiles(new_table, generation, profiles) do
     chain_instances_acc =
-      Enum.reduce(profiles, %{}, fn profile, acc ->
-        chain_ids = ConfigStore.list_chains_for_profile(profile)
-
-        Enum.reduce(chain_ids, acc, fn chain_id, chain_acc ->
-          case ConfigStore.get_chain(profile, chain_id) do
-            {:ok, chain_config} ->
-              build_chain_entries(
-                new_table,
-                generation,
-                profile,
-                chain_id,
-                chain_config,
-                chain_acc
-              )
-
-            {:error, _} ->
-              chain_acc
-          end
+      Enum.reduce(profiles, %{}, fn {profile, chains}, acc ->
+        Enum.reduce(chains, acc, fn {chain_id, config}, chain_acc ->
+          build_chain_entries(new_table, generation, profile, chain_id, config, chain_acc)
         end)
       end)
 
