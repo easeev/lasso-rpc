@@ -52,6 +52,8 @@ defmodule Lasso.Core.Support.ErrorClassification do
   - Constraint-based errors (`:block_not_available`, `:capability_violation`, `:rate_limit`) do not penalize
   """
 
+  alias Lasso.Core.Support.ErrorResolution
+
   @max_classification_message_graphemes 4_096
 
   # ===========================================================================
@@ -242,16 +244,16 @@ defmodule Lasso.Core.Support.ErrorClassification do
     # PublicNode
     "specify an address",
     # Block range constraints
-    "block range exceeded",
-    "max block range",
-    "block range too large",
+    {"block range exceeded", :block_span},
+    {"max block range", :block_span},
+    {"block range too large", :block_span},
     "range too large",
     "range not supported",
     # PublicNode
     "this range of parameters is not supported",
-    "exceeds maximum block range",
+    {"exceeds maximum block range", :block_span},
     "invalid block range",
-    "max is 1k blocks",
+    {"max is 1k blocks", :block_span},
     "range is too large",
     "blocks are not supported",
     # DRPC
@@ -300,6 +302,11 @@ defmodule Lasso.Core.Support.ErrorClassification do
     "state not available"
   ]
 
+  # Only these existing capability rules identify a block-span dimension. Generic
+  # range/plan language carries no dimension; a matched rule is still a claim.
+  @block_span_patterns for {pattern, :block_span} <- @capability_violation_patterns,
+                           do: pattern
+
   # Affirmative plan restrictions may override Invalid Request. A tier name or
   # upgrade phrase alone is insufficient: either can appear in a quoted input.
   @plan_restriction_patterns [
@@ -341,7 +348,7 @@ defmodule Lasso.Core.Support.ErrorClassification do
   def categorize(code, message)
 
   def categorize(@invalid_request, message) when is_binary(message) do
-    {category, _path} = do_categorize(@invalid_request, message)
+    {category, _path, _claim} = do_categorize(@invalid_request, message)
     category
   end
 
@@ -376,59 +383,84 @@ defmodule Lasso.Core.Support.ErrorClassification do
   @doc false
   @spec categorize_with_path(integer(), String.t() | nil, binary() | map() | nil) ::
           {atom(), atom()}
-  def categorize_with_path(code, message, data \\ nil)
+  def categorize_with_path(code, message, data \\ nil) do
+    {category, path, _claim} = categorize_with_claim(code, message, data)
+    {category, path}
+  end
 
-  def categorize_with_path(code, message, data) when is_binary(data) do
+  @doc """
+  Retains the dimension of the static message rule that supplied the category.
+
+  The claim is body-free matcher attribution, not provider truth or a numerical
+  bound. Mixed recognized span/volume rules and truncated messages have no typed
+  claim.
+  """
+  @spec categorize_with_claim(integer(), String.t() | nil, term()) ::
+          {atom(), atom(), ErrorResolution.constraint_claim()}
+  def categorize_with_claim(code, message, data \\ nil)
+
+  def categorize_with_claim(code, message, data) when is_binary(data) do
     if revert_data?(data),
-      do: {:execution_revert, :data_selector},
+      do: {:execution_revert, :data_selector, :unknown},
       else: do_categorize(code, message)
   end
 
-  def categorize_with_path(code, message, %{"data" => inner}) when is_binary(inner) do
+  def categorize_with_claim(code, message, %{"data" => inner}) when is_binary(inner) do
     if revert_data?(inner),
-      do: {:execution_revert, :data_selector},
+      do: {:execution_revert, :data_selector, :unknown},
       else: do_categorize(code, message)
   end
 
-  def categorize_with_path(code, message, _data), do: do_categorize(code, message)
+  def categorize_with_claim(code, message, _data), do: do_categorize(code, message)
 
   defp do_categorize(@invalid_request, message) when is_binary(message) do
-    message = message |> bounded_message() |> String.downcase()
+    {message, complete?} = claim_message(message)
 
     # Argument and execution evidence takes precedence over plan restrictions.
     if not contains_any?(message, ["invalid param"]) and
-         contains_any?(message, @plan_restriction_patterns) and
-         classify_by_message(message) == :capability_violation do
-      {:capability_violation, :message_pattern}
+         contains_any?(message, @plan_restriction_patterns) do
+      case classify_message(message) do
+        {:capability_violation, claim} ->
+          {:capability_violation, :message_pattern, complete_claim(claim, complete?)}
+
+        _other ->
+          {:invalid_request, :definitive_code, :unknown}
+      end
     else
-      {:invalid_request, :definitive_code}
+      {:invalid_request, :definitive_code, :unknown}
     end
   end
 
   defp do_categorize(code, _message)
        when code in @definitive_error_codes,
-       do: {classify_by_code(code), :definitive_code}
+       do: {classify_by_code(code), :definitive_code, :unknown}
 
   defp do_categorize(code, message) when is_binary(message) do
-    bounded_message = message |> bounded_message() |> String.downcase()
+    {message, complete?} = claim_message(message)
 
-    bounded_message
-    |> classify_by_message()
-    |> case do
-      nil ->
-        {classify_by_code(code), :code_based}
+    case classify_message(message) do
+      {nil, _claim} ->
+        {classify_by_code(code), :code_based, :unknown}
 
-      :rate_limit ->
-        if definitive_rate_limit_message?(bounded_message),
-          do: {:rate_limit, :definitive_capacity_message},
-          else: {:rate_limit, :message_pattern}
+      {:rate_limit, _claim} ->
+        if definitive_rate_limit_message?(message),
+          do: {:rate_limit, :definitive_capacity_message, :unknown},
+          else: {:rate_limit, :message_pattern, :unknown}
 
-      category ->
-        {category, :message_pattern}
+      {category, claim} ->
+        {category, :message_pattern, complete_claim(claim, complete?)}
     end
   end
 
-  defp do_categorize(code, _message), do: {classify_by_code(code), :code_based}
+  defp do_categorize(code, _message), do: {classify_by_code(code), :code_based, :unknown}
+
+  defp claim_message(message) do
+    bounded = bounded_message(message)
+    {String.downcase(bounded), byte_size(bounded) == byte_size(message)}
+  end
+
+  defp complete_claim(claim, true), do: claim
+  defp complete_claim(_claim, false), do: :unknown
 
   @doc """
   Identifies the affirmative plan restrictions admitted under code -32600.
@@ -657,51 +689,70 @@ defmodule Lasso.Core.Support.ErrorClassification do
   # ===========================================================================
 
   defp classify_by_message(message_lower) do
+    {category, _claim} = classify_message(message_lower)
+    category
+  end
+
+  defp classify_message(message_lower) do
     cond do
       # Explicit EVM execution evidence is request-caused and must outrank broad
       # provider phrases such as "access denied" or "please retry".
       contains_any?(message_lower, @execution_revert_patterns) ->
-        :execution_revert
+        {:execution_revert, :unknown}
 
       # Explicit argument validation outranks provider phrases embedded in an
       # invalid value or accompanying guidance.
       contains_any?(message_lower, @invalid_params_patterns) ->
-        :invalid_params
+        {:invalid_params, :unknown}
 
       # Provider capacity signals
       contains_any?(message_lower, @rate_limit_patterns) ->
-        :rate_limit
+        {:rate_limit, :unknown}
 
       contains_any?(message_lower, ["unsupported subscription", "timeout on the free tier"]) ->
-        :capability_violation
+        {:capability_violation, :unknown}
 
       # Auth errors
       contains_any?(message_lower, @auth_patterns) ->
-        :auth_error
+        {:auth_error, :unknown}
 
       # Transient/retriable server errors (check before capability violations)
       # Patterns like "please retry" indicate the provider wants a retry
       contains_any?(message_lower, @transient_error_patterns) ->
-        :server_error
+        {:server_error, :unknown}
 
       # Block-not-available errors (check before capability violations to avoid
       # "not available"/"not found" patterns in @capability_violation_patterns swallowing these)
       block_not_available_match?(message_lower) ->
-        :block_not_available
+        {:block_not_available, :unknown}
 
       # Result size violations are provider-specific capabilities, not client errors
       # Different providers have different limits (10k free tier, 100k+ premium)
       contains_any?(message_lower, @result_size_violation_patterns) ->
-        :capability_violation
+        claim =
+          if contains_any?(message_lower, @block_span_patterns),
+            do: :unknown,
+            else: :result_volume
 
-      # Other capability constraints
-      contains_any?(message_lower, @capability_violation_patterns) ->
-        :capability_violation
+        {:capability_violation, claim}
 
       true ->
-        nil
+        capability_claim(message_lower)
     end
   end
+
+  defp capability_claim(message) do
+    case Enum.find(@capability_violation_patterns, &capability_pattern_matches?(message, &1)) do
+      {_pattern, claim} -> {:capability_violation, claim}
+      pattern when is_binary(pattern) -> {:capability_violation, :unknown}
+      nil -> {nil, :unknown}
+    end
+  end
+
+  defp capability_pattern_matches?(message, {pattern, _claim}),
+    do: String.contains?(message, pattern)
+
+  defp capability_pattern_matches?(message, pattern), do: String.contains?(message, pattern)
 
   defp contains_any?(message, patterns) do
     Enum.any?(patterns, &String.contains?(message, &1))

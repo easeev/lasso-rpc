@@ -9,6 +9,8 @@ defmodule Lasso.Core.Support.ErrorResolution do
 
   The record retains no message, response data, request parameters or credentials.
   Its scope is attribution, not qualified capability evidence or a learned bound.
+  `constraint_claim` describes the matched static rule. Provider overrides and
+  legacy records have an unknown dimension; no learner admission follows from it.
   """
 
   alias Lasso.Core.Support.ErrorClassification
@@ -26,7 +28,9 @@ defmodule Lasso.Core.Support.ErrorResolution do
     :provider_health_failure?,
     :scope
   ]
-  defstruct @enforce_keys
+  defstruct @enforce_keys ++ [constraint_claim: :unknown]
+
+  @type constraint_claim :: :unknown | :block_span | :result_volume
 
   @type t :: %__MODULE__{
           code: integer() | nil,
@@ -36,6 +40,7 @@ defmodule Lasso.Core.Support.ErrorResolution do
           classification_path: atom(),
           baseline_category: atom(),
           baseline_path: atom(),
+          constraint_claim: constraint_claim(),
           retriable?: boolean(),
           breaker_penalty?: boolean(),
           provider_health_failure?: boolean(),

@@ -172,6 +172,39 @@ defmodule Lasso.RPC.RequestPipelineIntegrationTest do
     end
   end
 
+  test "retains only typed static constraint attribution through a routed error", %{chain: chain} do
+    for {message, expected} <- [
+          {"block range too large", :block_span},
+          {"query returned more than 10000 results", :result_volume},
+          {"block range too large; query returned more than 10000 results", :unknown},
+          {"range not supported", :unknown},
+          {"block range too large" <> String.duplicate(" ", 4_100), :unknown}
+        ] do
+      setup_providers([
+        %{
+          id: "constraint_claim",
+          priority: 10,
+          background_observations: false,
+          behavior: {:error, JError.new(-32_000, message)}
+        }
+      ])
+
+      assert {:error, error, ctx} =
+               RequestPipeline.execute_via_channels(
+                 chain,
+                 "eth_call",
+                 [%{"to" => "0x0000000000000000000000000000000000000001"}, "latest"],
+                 %RequestOptions{profile: "public", strategy: :priority, timeout_ms: 5_000}
+               )
+
+      assert error.resolution.constraint_claim == expected
+      assert error.category == :capability_violation
+      assert length(ctx.attempted_channels) == 1
+      refute Map.has_key?(JError.to_map(error), "resolution")
+      refute Map.has_key?(Jason.decode!(Jason.encode!(error)), "resolution")
+    end
+  end
+
   describe "oversized eth_getLogs contract" do
     test "preserves argument validation even when a quoted value mentions a range limit", %{
       chain: chain

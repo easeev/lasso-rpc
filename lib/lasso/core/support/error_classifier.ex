@@ -3,9 +3,13 @@ defmodule Lasso.Core.Support.ErrorClassifier do
   Unified error classification with provider-specific overrides.
 
   Classification flow:
-  1. Attempts provider-specific classification via declarative error_rules
-  2. Falls back to centralized classification rules
-  3. Derives all properties (retriable?, breaker_penalty?) from the final category
+  1. Protects structural reverts and definitive baseline evidence
+  2. Applies declared provider rules to unprotected claims, with static fallback
+  3. Derives retry and health properties from the final category; shared-provider
+     control may retain the baseline category independently
+
+  Static constraint dimensions describe the matched message rule. Provider
+  overrides retain an unknown dimension and do not establish numerical support.
   """
 
   alias Lasso.Core.Support.{ErrorClassification, ErrorResolution}
@@ -29,6 +33,7 @@ defmodule Lasso.Core.Support.ErrorClassifier do
   @doc "Resolves static and provider policy once, retaining body-free provenance and control decisions."
   @spec resolve(integer(), String.t() | nil, keyword()) :: ErrorResolution.t()
   def resolve(code, message, opts \\ []) do
+    original_message = message
     message = bounded_message(message)
     provider_id = Keyword.get(opts, :provider_id)
     profile = Keyword.get(opts, :profile)
@@ -36,8 +41,8 @@ defmodule Lasso.Core.Support.ErrorClassifier do
     capabilities = Keyword.get(opts, :provider_capabilities)
     data = Keyword.get(opts, :data)
 
-    {baseline_category, baseline_path} =
-      ErrorClassification.categorize_with_path(code, message, data)
+    {baseline_category, baseline_path, baseline_claim} =
+      ErrorClassification.categorize_with_claim(code, original_message, data)
 
     {category, classification_path} =
       if definitive_baseline_evidence?(baseline_category, baseline_path) do
@@ -63,6 +68,8 @@ defmodule Lasso.Core.Support.ErrorClassifier do
       classification_path: classification_path,
       baseline_category: baseline_category,
       baseline_path: baseline_path,
+      constraint_claim:
+        if(classification_path == :provider_rule, do: :unknown, else: baseline_claim),
       retriable?: retriable?,
       breaker_penalty?: breaker_penalty?,
       provider_health_failure?: ErrorClassification.provider_health_failure?(category),
@@ -73,7 +80,7 @@ defmodule Lasso.Core.Support.ErrorClassifier do
     resolution
   end
 
-  @doc "Emits classification telemetry with a bounded fingerprint and data kind."
+  @doc "Emits the legacy classification observation after a prepared error is retained."
   @spec observe(ErrorResolution.t(), String.t() | nil, term()) :: :ok
   def observe(%ErrorResolution{} = resolution, message, data) do
     message_fingerprint = message |> bounded_message() |> message_fingerprint()
