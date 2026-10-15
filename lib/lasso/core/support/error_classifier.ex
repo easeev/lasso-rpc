@@ -3,12 +3,16 @@ defmodule Lasso.Core.Support.ErrorClassifier do
   Unified error classification with provider-specific overrides.
 
   Classification flow:
-  1. Attempts provider-specific classification via declarative error_rules
-  2. Falls back to centralized classification rules
-  3. Derives all properties (retriable?, breaker_penalty?) from the final category
+  1. Protects structural reverts and definitive baseline evidence
+  2. Applies declared provider rules to unprotected claims, with static fallback
+  3. Derives retry and health properties from the final category; shared-provider
+     control may retain the baseline category independently
+
+  Static constraint dimensions describe the matched message rule. Provider
+  overrides retain an unknown dimension and do not establish numerical support.
   """
 
-  alias Lasso.Core.Support.ErrorClassification
+  alias Lasso.Core.Support.{ErrorClassification, ErrorResolution}
   alias Lasso.Providers.Catalog
   alias Lasso.RPC.Providers.Capabilities
 
@@ -23,16 +27,22 @@ defmodule Lasso.Core.Support.ErrorClassifier do
           breaker_penalty?: boolean()
         }
   def classify(code, message, opts \\ []) do
+    code |> resolve(message, opts) |> ErrorResolution.classification()
+  end
+
+  @doc "Resolves static and provider policy once, retaining body-free provenance and control decisions."
+  @spec resolve(integer(), String.t() | nil, keyword()) :: ErrorResolution.t()
+  def resolve(code, message, opts \\ []) do
+    original_message = message
     message = bounded_message(message)
-    message_fingerprint = message_fingerprint(message)
     provider_id = Keyword.get(opts, :provider_id)
     profile = Keyword.get(opts, :profile)
     chain = Keyword.get(opts, :chain_id) || Keyword.get(opts, :chain)
     capabilities = Keyword.get(opts, :provider_capabilities)
     data = Keyword.get(opts, :data)
 
-    {baseline_category, baseline_path} =
-      ErrorClassification.categorize_with_path(code, message, data)
+    {baseline_category, baseline_path, baseline_claim} =
+      ErrorClassification.categorize_with_claim(code, original_message, data)
 
     {category, classification_path} =
       if definitive_baseline_evidence?(baseline_category, baseline_path) do
@@ -50,33 +60,54 @@ defmodule Lasso.Core.Support.ErrorClassifier do
     retriable? = ErrorClassification.retriable_for_category?(category)
     breaker_penalty? = ErrorClassification.breaker_penalty?(category)
 
+    resolution = %ErrorResolution{
+      code: code,
+      category: category,
+      control_category: control_category,
+      shared_control?: shared_control?,
+      classification_path: classification_path,
+      baseline_category: baseline_category,
+      baseline_path: baseline_path,
+      constraint_claim:
+        if(classification_path == :provider_rule, do: :unknown, else: baseline_claim),
+      retriable?: retriable?,
+      breaker_penalty?: breaker_penalty?,
+      provider_health_failure?: ErrorClassification.provider_health_failure?(category),
+      scope: %{profile: profile, chain_id: chain, provider_id: provider_id}
+    }
+
+    if Keyword.get(opts, :emit?, true), do: observe(resolution, message, data)
+    resolution
+  end
+
+  @doc "Emits the legacy classification observation after a prepared error is retained."
+  @spec observe(ErrorResolution.t(), String.t() | nil, term()) :: :ok
+  def observe(%ErrorResolution{} = resolution, message, data) do
+    message_fingerprint = message |> bounded_message() |> message_fingerprint()
+    provider_id = resolution.scope.provider_id
+
     emit_classification_telemetry(
-      code,
+      resolution.code,
       message_fingerprint,
       data_kind(data),
       provider_id,
-      category,
-      classification_path,
-      control_category,
-      shared_control?
+      resolution.category,
+      resolution.classification_path,
+      resolution.control_category,
+      resolution.shared_control?
     )
 
-    if category == :unclassified_server_error do
+    if resolution.category == :unclassified_server_error do
       Logger.warning("Unclassified upstream RPC error",
-        code: code,
+        code: resolution.code,
         provider_id: provider_id,
-        classification_path: classification_path,
+        classification_path: resolution.classification_path,
         message_fingerprint: message_fingerprint,
         data_kind: data_kind(data)
       )
     end
 
-    %{
-      category: category,
-      control_category: control_category,
-      retriable?: retriable?,
-      breaker_penalty?: breaker_penalty?
-    }
+    :ok
   end
 
   defp classify_with_path(code, message, data, provider_id, _profile, _chain, capabilities)

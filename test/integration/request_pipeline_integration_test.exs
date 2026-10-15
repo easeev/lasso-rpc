@@ -163,8 +163,51 @@ defmodule Lasso.RPC.RequestPipelineIntegrationTest do
 
         assert {error.code, error.message, error.data} == {-32_600, message, data}
         assert error.category == :capability_violation
+        assert error.resolution.category == :capability_violation
+        assert error.resolution.baseline_path == :message_pattern
+        assert JError.to_map(error) == %{"code" => -32_600, "message" => message, "data" => data}
+        refute Map.has_key?(Jason.decode!(Jason.encode!(error)), "resolution")
         assert length(ctx.attempted_channels) == 1
       end
+    end
+  end
+
+  for {{message, expected}, index} <-
+        Enum.with_index([
+          {"block range too large", :block_span},
+          {"query returned more than 10000 results", :result_volume},
+          {"block range too large; query returned more than 10000 results", :unknown},
+          {"range not supported", :unknown},
+          {"block range too large" <> String.duplicate(" ", 4_100), :unknown}
+        ]) do
+    test "retains only typed static constraint attribution through routed error #{index}", %{
+      chain: chain
+    } do
+      message = unquote(message)
+      expected = unquote(expected)
+
+      setup_providers([
+        %{
+          id: "constraint_claim",
+          priority: 10,
+          background_observations: false,
+          behavior: {:error, JError.new(-32_000, message)}
+        }
+      ])
+
+      assert {:error, error, ctx} =
+               RequestPipeline.execute_via_channels(
+                 chain,
+                 "eth_call",
+                 [%{"to" => "0x0000000000000000000000000000000000000001"}, "latest"],
+                 %RequestOptions{profile: "public", strategy: :priority, timeout_ms: 5_000}
+               )
+
+      assert error.resolution.constraint_claim == expected
+      assert error.category == :capability_violation
+      assert length(ctx.attempted_channels) == 1
+      refute Map.has_key?(JError.to_map(error), "resolution")
+      refute Map.has_key?(Jason.decode!(Jason.encode!(error)), "resolution")
     end
   end
 
