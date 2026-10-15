@@ -848,8 +848,7 @@ defmodule Lasso.Core.Streaming.UpstreamSubscriptionPoolTest do
       on_exit(fn -> if Process.alive?(manager), do: :sys.resume(manager) end)
 
       send(pool, {:reestablish_after_restart, key, instance_id})
-      assert %{keys: keys_after_restart} = :sys.get_state(pool, 250)
-      assert Map.has_key?(keys_after_restart, key)
+      assert %{keys: _keys_after_restart} = :sys.get_state(pool, 250)
 
       assert TestHelper.eventually(fn ->
                case get_pool_state(chain_id).keys[key] do
@@ -864,8 +863,14 @@ defmodule Lasso.Core.Streaming.UpstreamSubscriptionPoolTest do
                :sys.get_state(coordinator, 250)
 
       send(pool, {:instance_subscription_invalidated, instance_id, key, :subscription_stale})
-      assert %{keys: keys_after_stale} = :sys.get_state(pool, 250)
-      assert Map.has_key?(keys_after_stale, key)
+      assert %{keys: _keys_after_stale} = :sys.get_state(pool, 250)
+
+      :ok = :sys.resume(manager)
+
+      assert {:ok, _recovered_subscription} =
+               UpstreamSubscriptionPool.subscribe_client(profile, chain_id, self(), key)
+
+      :ok = wait_until_key_active(chain_id, key)
     end
 
     test "pool re-establishes subscriptions after manager restart broadcast", %{
