@@ -172,14 +172,20 @@ defmodule Lasso.RPC.RequestPipelineIntegrationTest do
     end
   end
 
-  test "retains only typed static constraint attribution through a routed error", %{chain: chain} do
-    for {message, expected} <- [
+  for {{message, expected}, index} <-
+        Enum.with_index([
           {"block range too large", :block_span},
           {"query returned more than 10000 results", :result_volume},
           {"block range too large; query returned more than 10000 results", :unknown},
           {"range not supported", :unknown},
           {"block range too large" <> String.duplicate(" ", 4_100), :unknown}
-        ] do
+        ]) do
+    test "retains only typed static constraint attribution through routed error #{index}", %{
+      chain: chain
+    } do
+      message = unquote(message)
+      expected = unquote(expected)
+
       setup_providers([
         %{
           id: "constraint_claim",
