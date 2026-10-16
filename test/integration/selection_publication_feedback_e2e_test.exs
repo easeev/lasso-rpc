@@ -307,8 +307,25 @@ defmodule Lasso.RPC.SelectionPublicationFeedbackE2ETest do
     )
 
     on_exit(fn -> :telemetry.detach(handler) end)
-    assert {:error, _, ctx} = request(chain)
+    terminal_handler = {handler, :terminal}
+
+    :telemetry.attach(
+      terminal_handler,
+      [:lasso, :rpc, :request, :terminal],
+      fn _, _, metadata, _ ->
+        if metadata.chain_id == chain, do: send(observer, {:terminal_cause, metadata})
+      end,
+      nil
+    )
+
+    on_exit(fn -> :telemetry.detach(terminal_handler) end)
+    assert {:error, error, ctx} = request(chain)
     assert ctx.execution_envelope.dispatch_count == 0
+    assert_receive {:terminal_cause, %{exhaustion_cause: :no_candidates}}, 5_000
+
+    assert %Lasso.RPC.RequestTerminal.OrdinaryExhaustion{reason: :providers_exhausted} =
+             RequestPipeline.build_request_terminal(:error, error, ctx)
+
     assert_receive {:exhausted, evidence}
 
     assert [%{provider_id: "closed-route", transport: :http, reason: :circuit_open}] =
@@ -316,6 +333,31 @@ defmodule Lasso.RPC.SelectionPublicationFeedbackE2ETest do
 
     refute Jason.encode!(evidence) =~ "mock-closed-route.test"
     assert byte_size(Jason.encode!(evidence)) <= 6_000
+  end
+
+  test "unavailable catalog capture keeps its bounded phase evidence", %{chain: chain} do
+    setup_providers([%{id: "capture", background_observations: false}])
+    snapshot = Catalog.snapshot()
+    key = Catalog.persistent_term_key()
+    :persistent_term.erase(key)
+    on_exit(fn -> :persistent_term.put(key, snapshot) end)
+    observer = self()
+    handler = {__MODULE__, make_ref()}
+
+    :telemetry.attach(
+      handler,
+      [:lasso, :routing, :selection_exhausted],
+      fn _, _, metadata, _ -> send(observer, {:capture_failed, metadata}) end,
+      nil
+    )
+
+    on_exit(fn -> :telemetry.detach(handler) end)
+    assert {:error, _, ctx} = request(chain)
+    assert ctx.execution_envelope.dispatch_count == 0
+    assert_receive {:capture_failed, evidence}
+    assert %{catalog_status: :unavailable, catalog_generation: nil} = evidence.capture_failure
+    assert is_integer(evidence.capture_failure.config_generation)
+    :persistent_term.put(key, snapshot)
   end
 
   defp request(chain, provider_override \\ nil) do

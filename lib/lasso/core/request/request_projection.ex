@@ -18,23 +18,24 @@ defmodule Lasso.RPC.RequestProjection do
   alias Lasso.RPC.ExecutionFact.Codec
 
   @schema :lasso_request_projection
-  @version 1
+  @version 2
   @max_bytes 4_096
   @dispatcher Lasso.ExecutionProjectionDispatcher
   @routing_decisions_per_second 256
   @routing_budget_buckets 256
 
   @enforce_keys [:version, :fact, :method, :request_origin, :failover_count, :emitted_at_ms]
-  defstruct @enforce_keys ++ [:provider_id, :instance_id, :transport]
+  defstruct @enforce_keys ++ [:provider_id, :instance_id, :transport, :exhaustion_cause]
 
   @type route_identity :: %{
-          provider_id: binary(),
+          optional(:exhaustion_cause) => atom() | nil,
+          provider_id: binary() | nil,
           instance_id: binary() | nil,
-          transport: :http | :ws
+          transport: :http | :ws | nil
         }
 
   @type t :: %__MODULE__{
-          version: 1,
+          version: 2,
           fact: RequestTerminal.t(),
           method: binary(),
           provider_id: binary() | nil,
@@ -42,6 +43,7 @@ defmodule Lasso.RPC.RequestProjection do
           transport: :http | :ws | nil,
           request_origin: :client | :system,
           failover_count: 0..16,
+          exhaustion_cause: atom() | nil,
           emitted_at_ms: non_neg_integer()
         }
 
@@ -60,6 +62,7 @@ defmodule Lasso.RPC.RequestProjection do
       provider_id: route_value(route_identity, :provider_id),
       instance_id: route_value(route_identity, :instance_id),
       transport: route_value(route_identity, :transport),
+      exhaustion_cause: route_value(route_identity, :exhaustion_cause),
       request_origin: request_origin,
       failover_count: failover_count,
       emitted_at_ms: System.system_time(:millisecond)
@@ -178,7 +181,8 @@ defmodule Lasso.RPC.RequestProjection do
         event.transport,
         event.request_origin,
         event.failover_count,
-        event.emitted_at_ms
+        event.emitted_at_ms,
+        event.exhaustion_cause
       })
 
     if byte_size(payload) <= @max_bytes,
@@ -190,7 +194,7 @@ defmodule Lasso.RPC.RequestProjection do
 
   @spec decode(binary()) :: {:ok, t()} | {:error, atom()}
   def decode(payload) when is_binary(payload) and byte_size(payload) <= @max_bytes do
-    case :erlang.binary_to_term(payload, [:safe]) do
+    case normalize_envelope(:erlang.binary_to_term(payload, [:safe])) do
       {
         @schema,
         @version,
@@ -201,7 +205,8 @@ defmodule Lasso.RPC.RequestProjection do
         transport,
         request_origin,
         failover_count,
-        emitted_at_ms
+        emitted_at_ms,
+        exhaustion_cause
       } ->
         case decode_fact_payload(fact_payload) do
           {:ok, fact} ->
@@ -214,6 +219,7 @@ defmodule Lasso.RPC.RequestProjection do
               transport: transport,
               request_origin: request_origin,
               failover_count: failover_count,
+              exhaustion_cause: exhaustion_cause,
               emitted_at_ms: emitted_at_ms
             }
 
@@ -228,6 +234,11 @@ defmodule Lasso.RPC.RequestProjection do
       when is_integer(version) ->
         {:error, :unsupported_version}
 
+      {@schema, version, _fact, _method, _provider, _instance, _transport, _request_origin,
+       _failovers, _emitted_at_ms, _exhaustion}
+      when is_integer(version) ->
+        {:error, :unsupported_version}
+
       _other ->
         {:error, :invalid_event}
     end
@@ -236,6 +247,15 @@ defmodule Lasso.RPC.RequestProjection do
   end
 
   def decode(payload) when is_binary(payload), do: {:error, :event_too_large}
+
+  defp normalize_envelope(
+         {@schema, 1, fact, method, provider, instance, transport, origin, failovers, emitted}
+       ) do
+    {@schema, @version, fact, method, provider, instance, transport, origin, failovers, emitted,
+     nil}
+  end
+
+  defp normalize_envelope(envelope), do: envelope
 
   defp decode_fact_payload(fact_payload) when is_binary(fact_payload),
     do: Codec.decode(fact_payload)
@@ -354,7 +374,8 @@ defmodule Lasso.RPC.RequestProjection do
        request_origin: event.request_origin,
        duration_ms: div(Map.fetch!(fact, :elapsed_us), 1_000),
        result: result(event.fact),
-       failover_count: event.failover_count
+       failover_count: event.failover_count,
+       exhaustion_cause: event.exhaustion_cause
      )}
   end
 
@@ -458,6 +479,7 @@ defmodule Lasso.RPC.RequestProjection do
         result: result(fact),
         failovers: event.failover_count,
         diagnostic: projection.diagnostic,
+        exhaustion_cause: event.exhaustion_cause,
         candidate_admission_count: Map.fetch!(fact, :candidate_admission_count),
         dispatch_count: Map.fetch!(fact, :dispatch_count)
       }
@@ -508,6 +530,21 @@ defmodule Lasso.RPC.RequestProjection do
 
     if event.request_origin not in [:client, :system],
       do: raise(ArgumentError, "invalid request origin")
+
+    unless event.exhaustion_cause in [
+             nil,
+             :no_candidates,
+             :providers_exhausted,
+             :candidate_budget_exhausted,
+             :dispatch_budget_exhausted,
+             :admission_unavailable,
+             :chain_identity_rejected,
+             :breaker_receipt_stale,
+             :breaker_admission_timeout,
+             :breaker_unavailable,
+             :circuit_open
+           ],
+           do: raise(ArgumentError, "invalid exhaustion cause")
 
     %{
       event
