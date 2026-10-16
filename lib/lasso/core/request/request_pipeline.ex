@@ -52,7 +52,7 @@ defmodule Lasso.RPC.RequestPipeline do
   alias Lasso.RPC.RequestOptions
   alias Lasso.RPC.Response.Success
   alias Lasso.RPC.RoutingEvidence.Workload
-  alias Lasso.RPC.Selection.Exploration
+  alias Lasso.RPC.Selection.{Exhaustion, Exploration}
 
   # Type definitions
   @type chain_id :: pos_integer()
@@ -319,6 +319,14 @@ defmodule Lasso.RPC.RequestPipeline do
           finalize_caller_abandoned(ctx)
 
         {:error, :deadline_exhausted} ->
+          if is_nil(selected),
+            do:
+              Exhaustion.log_failure(
+                ctx,
+                remaining,
+                :deadline_exhausted
+              )
+
           finalize_bounded_error(ctx, :deadline_exhausted)
       end
     after
@@ -1298,7 +1306,7 @@ defmodule Lasso.RPC.RequestPipeline do
 
   @spec handle_no_channels(RequestContext.t(), atom(), candidates()) :: result()
   defp handle_no_channels(ctx, reason, candidates) do
-    Lasso.RPC.Selection.Exhaustion.record(ctx, candidates, reason)
+    Exhaustion.record(ctx, candidates, reason)
     profile = if ctx.opts, do: ctx.opts.profile, else: ProfileValidator.default_profile()
 
     retry_after_ms =
@@ -1413,6 +1421,9 @@ defmodule Lasso.RPC.RequestPipeline do
     do: [caller_guard: caller_guard]
 
   defp finalize_bounded_error(ctx, reason) do
+    if reason == :deadline_exhausted and is_nil(ctx.selection_start),
+      do: Exhaustion.log_failure(ctx, [], reason)
+
     {message, category} =
       case reason do
         :deadline_exhausted ->

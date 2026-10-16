@@ -171,7 +171,12 @@ defmodule Lasso.Observability.PrometheusMetrics do
   end
 
   defp observe([:lasso, :routing, :selection_exhausted], _ms, meta) do
-    counter("lasso_routing_selection_exhausted_total", reason: enum(meta[:reason]))
+    counter("lasso_routing_selection_exhausted_total",
+      reason: enum(meta[:reason]),
+      profile: identity(meta[:profile]),
+      chain: chain(meta),
+      fallback: to_string(meta[:fallback] == true)
+    )
   end
 
   defp observe([:lasso, :rpc, :request, :stop], ms, meta) do
