@@ -50,8 +50,8 @@ defmodule Lasso.Observability.PrometheusMetrics do
 
   @route_labels [:profile, :chain, :provider, :method, :transport, :origin, :outcome]
   @definitions [
-    {"lasso_rpc_routing_outcomes_total", :counter,
-     "Routing outcomes with bounded exhaustion causes"},
+    {"lasso_rpc_diagnostic_outcomes_total", :counter,
+     "Diagnostic routing outcomes; successful detail is sampled"},
     {"lasso_routing_selection_exhausted_total", :counter, "Exhausted routing selection phases"},
     {"lasso_rpc_request_duration_seconds", :histogram,
      "Routed completion duration, including failovers"},
@@ -164,7 +164,7 @@ defmodule Lasso.Observability.PrometheusMetrics do
   end
 
   defp observe([:lasso, :rpc, :request, :terminal], _ms, meta) do
-    counter("lasso_rpc_routing_outcomes_total",
+    counter("lasso_rpc_diagnostic_outcomes_total",
       result: enum(meta[:result]),
       exhaustion_cause: enum(meta[:exhaustion_cause])
     )
