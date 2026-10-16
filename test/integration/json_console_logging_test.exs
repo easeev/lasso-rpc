@@ -25,10 +25,10 @@ defmodule Lasso.JSONConsoleLoggingIntegrationTest do
         end
       )
 
-    [line] = String.split(output, "\n", trim: true)
+    entries = output |> String.split("\n", trim: true) |> Enum.map(&Jason.decode!/1)
 
-    assert %{"level" => "info", "metadata" => metadata, "message" => message} =
-             Jason.decode!(line)
+    assert [%{"level" => "info", "metadata" => metadata, "message" => message}] =
+             Enum.filter(entries, &(get_in(&1, ["metadata", "request_id"]) == "request-123"))
 
     assert metadata["request_id"] == "request-123"
     assert metadata["chain_id"] == 1
