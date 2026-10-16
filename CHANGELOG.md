@@ -7,14 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-10-16
+
 ### Added
 
 - Bounded selection and exhaustion diagnostics identify admission gates and precise internal failure causes while preserving caller-facing error categories. Prometheus selection labels are bounded, and sampled routing outcome counters are explicitly identified as diagnostics.
-
 - `POST /rpc/priority/:chain` and `/rpc/profile/:profile/priority/:chain` route requests with the `priority` strategy. WebSocket clients can connect at `/ws/rpc/priority/:chain`, which previously resolved `priority` as the chain name.
 
 ### Changed
 
+- Load-balanced selection gives each physical upstream one first-pick share and tries distinct upstreams before sibling transports for replay-safe reads, within the existing dispatch budget and availability tiers.
 - The `latency-weighted` strategy is now `balanced-fast`, positioned between `load-balanced` and `fastest`. `latency-weighted` stays a permanent alias in HTTP and WebSocket URLs and the `strategy` query parameter, and routes identically. `lasso_meta.strategy` and request logs report `balanced_fast`, and the dashboard shows Balanced Fast. The module is `Lasso.RPC.Strategies.BalancedFast`, and its exponent is set with `BALANCED_FAST_BETA` (application key `:balanced_fast_beta`); `LW_BETA` is no longer read.
 - `GET /api/ready` without parameters now reports replica readiness: configuration loaded, catalog published, and distribution running when clustering is configured. It no longer reflects upstream state, so a dead upstream no longer takes every replica out of service. `?profile=&chain=` keeps the strict upstream-backed check, and `?profile=` alone still checks every chain in that profile. The scoped check now counts half-open HTTP routes with recovery capacity as eligible, as routing admits them.
 
@@ -24,12 +26,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Account for retained JSON-RPC errors within response memory limits. Release superseded and abandoned payloads, and retain worker ownership until the recipient adopts a result. Linked-parent shutdown cancels execution before another upstream send.
 - Fence physical quota feedback by breaker epoch and prevent stale responses from degrading replacement-generation learning.
 - Render dashboard method statistics when duration samples are absent.
-
+- Keep instance shutdown responsive during WebSocket handshakes and retain bounded, redacted close evidence for connection recovery diagnostics.
+- Replay-safe reads can fail over explicit provider plan restrictions reported as invalid requests. Error classification retains nonserialized resolution provenance without changing the customer JSON-RPC shape.
+- Prometheus scrapes use cached routing head evidence rather than waiting on a head owner.
 - `balanced-fast` no longer fails a request when a provider's mean successful latency reads 0. Weighting treats a zero mean as unmeasured, as qualification already does.
 - A request that ends unsuccessfully after every upstream it reached rejected the method returns that upstream's `-32601` with its message and data instead of `-32000`, unless a later candidate failed before dispatch, in which case the availability error is returned. A `-32601` mixed with another outcome, such as a provider failure, quota exhaustion, or timeout, no longer becomes the answer because it happened to come last; the caller receives the other outcome's error or the availability error. Retry behavior is unchanged: replay-safe reads continue to another upstream within their attempt budget, and unknown methods and `eth_sendRawTransaction` keep their single dispatch.
 - Concurrent first observations of a request series share one `lasso_rpc_requests_total` row instead of splitting into duplicate samples. Route totals are documented as exact while their routing scope stays published.
 - Exporter failures stay inside the exporter: a raising `MetricsScope` hook drops the observation and is counted, route-total reads keep their previous values, and telemetry handlers stay attached. Route totals count successes and errors separately, so neither moves backwards under concurrency, and are limited to 2,048 series per node.
 - A `RELEASE_COOKIE` that starts with `+` or `-` is now used as the distribution cookie, prefixed with `lasso`. `erl` parsed such a value as a flag: a leading `+` stopped the node before boot with `bad -n option`, which hits about 1 in 64 random base64 cookies, and a leading `-` was dropped, so the node used `~/.erlang.cookie` and could not cluster with nodes on other hosts. Release commands print a warning, and nodes and operator commands that share the configured value still agree.
+
+### Security
+
+- Update Decimal to 3.1.2 to address its rounding allocation advisory.
+
+### Compatibility
+
+- Rename `LW_BETA` to `BALANCED_FAST_BETA` (application key `:balanced_fast_beta`). The old optional tuning variable is no longer read.
+- Existing `latency-weighted` HTTP/WebSocket URLs and `strategy` values keep working as permanent aliases of `balanced-fast`; response metadata and logs report `balanced_fast`.
+- `/api/ready` without parameters now reports replica readiness. Load balancers that relied on upstream-backed readiness should use `/api/ready?profile=PROFILE&chain=CHAIN` for their route.
+- No required YAML profile schema, publication-journal migration, or benchmark-history migration. Preserve configured profiles, secrets, journal data and history when replacing containers. After global publication enrollment, rollback still requires a compatible binary or the documented coordinated disable procedure.
+- Signed raw transactions retain one upstream dispatch; no automatic resend is introduced. Client authentication remains the operator's reverse-proxy/network responsibility.
 
 ## [0.5.1] - 2026-10-06
 
@@ -387,7 +403,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Credo and Dialyzer static analysis
 - Comprehensive test suite (unit + integration)
 
-[Unreleased]: https://github.com/jaxernst/lasso-rpc/compare/v0.5.1...HEAD
+[Unreleased]: https://github.com/jaxernst/lasso-rpc/compare/v0.6.0...HEAD
+[0.6.0]: https://github.com/jaxernst/lasso-rpc/compare/v0.5.1...v0.6.0
 [0.5.1]: https://github.com/jaxernst/lasso-rpc/compare/v0.5.0...v0.5.1
 [0.5.0]: https://github.com/jaxernst/lasso-rpc/compare/v0.4.5...v0.5.0
 [0.4.5]: https://github.com/jaxernst/lasso-rpc/compare/v0.4.4...v0.4.5
