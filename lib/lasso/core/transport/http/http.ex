@@ -13,6 +13,7 @@ defmodule Lasso.RPC.Transports.HTTP do
   alias Lasso.Core.Transport.{AttemptProtocol, UpstreamAdmission, UpstreamResponse}
   alias Lasso.JSONRPC.Error, as: JError
   alias Lasso.RPC.PreparedRequest
+  alias Lasso.RPC.Response.Capacity
   alias Lasso.RPC.Transport.HTTP.Client, as: HttpClient
 
   @response_heap_tuning_key {__MODULE__, :response_heap_tuning_enabled}
@@ -305,40 +306,67 @@ defmodule Lasso.RPC.Transports.HTTP do
   end
 
   defp settle_raw_response(%{validation: {:error, %JError{} = jerr}} = input) do
-    release_response_lease(input, :jsonrpc_error)
-
     resolution =
       ErrorClassifier.resolve(jerr.code, jerr.message,
         data: jerr.data,
         provider_id: input.provider_id,
         profile: Map.get(input, :profile),
         chain_id: Map.get(input, :chain_id),
-        provider_capabilities: Map.get(input, :provider_capabilities)
+        provider_capabilities: Map.get(input, :provider_capabilities),
+        emit?: false
       )
 
-    AttemptProtocol.terminal_at(
-      input.dispatch_context,
-      :response,
-      %{
-        response_kind: :error,
-        error_code: jerr.code,
-        error_category: resolution.control_category,
-        io_duration_us: input.io_duration_us
-      },
-      input.validated_at_us
-    )
+    jerr = %{
+      jerr
+      | provider_id: input.provider_id,
+        source: :jsonrpc,
+        transport: :http,
+        category: resolution.category,
+        retriable?: resolution.retriable?,
+        breaker_penalty?: resolution.breaker_penalty?,
+        resolution: resolution
+    }
 
-    {:error,
-     %{
-       jerr
-       | provider_id: input.provider_id,
-         source: :jsonrpc,
-         transport: :http,
-         category: resolution.category,
-         retriable?: resolution.retriable?,
-         breaker_penalty?: resolution.breaker_penalty?,
-         resolution: resolution
-     }}
+    case retain_response_lease(jerr, input) do
+      {:ok, jerr} ->
+        :ok = ErrorClassifier.observe(resolution, jerr.message, jerr.data)
+
+        AttemptProtocol.terminal_at(
+          input.dispatch_context,
+          :response,
+          %{
+            response_kind: :error,
+            error_code: jerr.code,
+            error_category: resolution.control_category,
+            io_duration_us: input.io_duration_us
+          },
+          input.validated_at_us
+        )
+
+        {:error, jerr}
+
+      {:error, reason} ->
+        release_response_lease(input, :retention_refused)
+
+        AttemptProtocol.terminal_at(
+          input.dispatch_context,
+          :response,
+          %{
+            response_kind: :error,
+            error_code: -32_005,
+            error_category: :local_capacity_rejection,
+            io_duration_us: input.io_duration_us
+          },
+          input.validated_at_us
+        )
+
+        {:error,
+         ErrorNormalizer.normalize({:response_limit, reason},
+           provider_id: input.provider_id,
+           context: :transport,
+           transport: :http
+         )}
+    end
   end
 
   defp settle_raw_response(%{validation: {:invalid, parse_reason}} = input) do
@@ -365,17 +393,14 @@ defmodule Lasso.RPC.Transports.HTTP do
 
   defp retain_response_lease(response, %{response_lease: nil}), do: {:ok, response}
 
-  defp retain_response_lease(response, %{response_lease: lease, dispatch_context: context}) do
+  defp retain_response_lease(response, %{response_lease: lease} = input) do
     owner =
-      case context do
+      case input.dispatch_context do
         %AttemptProtocol.Context{owner: owner} -> owner
         _untracked -> self()
       end
 
-    case UpstreamAdmission.transfer(lease, owner) do
-      :ok -> {:ok, %{response | capacity_lease: lease}}
-      {:error, reason} -> {:error, reason}
-    end
+    Capacity.retain(response, lease, owner, byte_size(input.raw_bytes))
   end
 
   defp release_response_lease(%{response_lease: nil}, _reason), do: :ok

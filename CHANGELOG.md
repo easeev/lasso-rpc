@@ -9,6 +9,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Bounded selection and exhaustion diagnostics identify admission gates and precise internal failure causes while preserving caller-facing error categories. Prometheus selection labels are bounded, and sampled routing outcome counters are explicitly identified as diagnostics.
+
 - `POST /rpc/priority/:chain` and `/rpc/profile/:profile/priority/:chain` route requests with the `priority` strategy. WebSocket clients can connect at `/ws/rpc/priority/:chain`, which previously resolved `priority` as the chain name.
 
 ### Changed
@@ -17,6 +19,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `GET /api/ready` without parameters now reports replica readiness: configuration loaded, catalog published, and distribution running when clustering is configured. It no longer reflects upstream state, so a dead upstream no longer takes every replica out of service. `?profile=&chain=` keeps the strict upstream-backed check, and `?profile=` alone still checks every chain in that profile. The scoped check now counts half-open HTTP routes with recovery capacity as eligible, as routing admits them.
 
 ### Fixed
+
+- Keep routing on the matching published catalog while replacement configuration is prepared. Batch profile warming publishes validated changes together, repairs missing workers without republishing unchanged profiles, and preserves the previous catalog and controls when a candidate fails.
+- Account for retained JSON-RPC errors within response memory limits. Release superseded and abandoned payloads, and retain worker ownership until the recipient adopts a result. Linked-parent shutdown cancels execution before another upstream send.
+- Fence physical quota feedback by breaker epoch and prevent stale responses from degrading replacement-generation learning.
+- Render dashboard method statistics when duration samples are absent.
 
 - `balanced-fast` no longer fails a request when a provider's mean successful latency reads 0. Weighting treats a zero mean as unmeasured, as qualification already does.
 - A request that ends unsuccessfully after every upstream it reached rejected the method returns that upstream's `-32601` with its message and data instead of `-32000`, unless a later candidate failed before dispatch, in which case the availability error is returned. A `-32601` mixed with another outcome, such as a provider failure, quota exhaustion, or timeout, no longer becomes the answer because it happened to come last; the caller receives the other outcome's error or the availability error. Retry behavior is unchanged: replay-safe reads continue to another upstream within their attempt budget, and unknown methods and `eth_sendRawTransaction` keep their single dispatch.

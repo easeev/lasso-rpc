@@ -2,6 +2,7 @@ defmodule LassoWeb.RPCController.BatchExecutor do
   @moduledoc false
 
   alias Lasso.Core.Request.ExecutionScope
+  alias Lasso.RPC.Response.Capacity
 
   @default_max_active 4
   @retained_item_keys [:index, :request_id, :respond?]
@@ -75,7 +76,8 @@ defmodule LassoWeb.RPCController.BatchExecutor do
     child = fn ->
       scope = ExecutionScope.monitored(self(), parent, item.deadline_us)
       result = executor.(item, scope)
-      send(parent, {:batch_item_result, item_ref, self(), result})
+
+      Capacity.deliver(result, parent, item_ref, {:batch_item_result, item_ref, self(), result})
     end
 
     case start_owner(state.supervisor, Lasso.Observability.Tracing.wrap(child)) do
@@ -115,6 +117,7 @@ defmodule LassoWeb.RPCController.BatchExecutor do
       {:batch_item_result, item_ref, pid, result} ->
         case state.active_by_ref do
           %{^item_ref => %{pid: ^pid} = active} ->
+            result = Capacity.accept(result, pid, item_ref)
             Process.demonitor(active.monitor, [:flush])
 
             state
@@ -125,6 +128,8 @@ defmodule LassoWeb.RPCController.BatchExecutor do
             |> await_items()
 
           _other ->
+            Capacity.reject(result, pid, item_ref, :stale_batch_result)
+
             state
             |> update_counter(:stale_result)
             |> await_items()

@@ -23,7 +23,6 @@ defmodule Lasso.BlockSync.Strategies.HttpStrategy do
   require Logger
 
   alias Lasso.BlockSync.{Observation, Registry}
-  alias Lasso.Config.ConfigStore
   alias Lasso.Core.Request.ExecutionScope
   alias Lasso.Core.Support.{CircuitBreaker, ErrorClassification}
   alias Lasso.JSONRPC.Error, as: JError
@@ -403,8 +402,8 @@ defmodule Lasso.BlockSync.Strategies.HttpStrategy do
       end)
 
     case snapshot do
-      %{generation: generation} ->
-        if Catalog.snapshot() == snapshot and generation == ConfigStore.route_generation(),
+      %{generation: _generation} ->
+        if Catalog.snapshot() == snapshot,
           do: references,
           else: []
 
@@ -596,11 +595,35 @@ defmodule Lasso.BlockSync.Strategies.HttpStrategy do
       }
 
       case RequestPipeline.execute_owned(scope, plan.chain_id, "eth_blockNumber", [], opts) do
-        {:ok, response, _ctx} -> decode_poll_response(response)
-        {:error, reason, _ctx} -> {:error, reason}
+        {:ok, response, _ctx} ->
+          decode_poll_response(response)
+
+        {:error, reason, _ctx} ->
+          {:error, consume_poll_error(reason)}
       end
     end
   end
+
+  defp consume_poll_error(%JError{} = error) do
+    Lasso.RPC.Response.Capacity.release(error, :poll_consumed)
+
+    retry_after =
+      if is_map(error.data),
+        do: Map.get(error.data, :retry_after_ms) || Map.get(error.data, "retry_after_ms")
+
+    summary = JError.summary(error)
+
+    summary =
+      if ErrorClassification.quota_exhausted?(error.message),
+        do: %{summary | message: "quota exhausted"},
+        else: summary
+
+    if is_integer(retry_after) and retry_after > 0,
+      do: %{summary | data: %{retry_after_ms: retry_after}},
+      else: summary
+  end
+
+  defp consume_poll_error(error), do: error
 
   @doc false
   @spec decode_poll_response(term()) :: {:ok, non_neg_integer()} | {:error, term()}
@@ -626,7 +649,6 @@ defmodule Lasso.BlockSync.Strategies.HttpStrategy do
 
   defp resolve_route(instance_id, chain_id) do
     snapshot = Catalog.snapshot()
-    current_generation = ConfigStore.route_generation()
 
     route =
       instance_id
@@ -641,7 +663,7 @@ defmodule Lasso.BlockSync.Strategies.HttpStrategy do
 
     case route do
       {profile, provider_id}
-      when not is_nil(snapshot) and snapshot.generation == current_generation ->
+      when not is_nil(snapshot) ->
         if Catalog.snapshot() == snapshot,
           do: {:ok, profile, provider_id},
           else: {:error, :route_changed}

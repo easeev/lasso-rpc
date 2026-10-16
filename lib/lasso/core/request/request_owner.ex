@@ -27,7 +27,21 @@ defmodule Lasso.Core.Request.RequestOwner do
   end
 
   @type option ::
-          {:caller_guard, ExecutionScope.CallerGuard.t()} | {:test_before_restore, (-> term())}
+          {:caller_guard, ExecutionScope.CallerGuard.t()}
+          | {:test_before_restore, (-> term())}
+
+  defguardp is_shutdown(reason)
+            when reason == :shutdown or
+                   (is_tuple(reason) and tuple_size(reason) == 2 and elem(reason, 0) == :shutdown)
+
+  @shutdown_requested {__MODULE__, :shutdown_requested}
+
+  @doc """
+  Whether a linked parent asked this process to shut down during an attempt. The request stays
+  abandoned for the rest of the process, even when a completion already queued won that attempt.
+  """
+  @spec shutdown_requested?() :: boolean()
+  def shutdown_requested?, do: Process.get(@shutdown_requested, false)
 
   @spec execute(AttemptIdentity.t(), integer(), (-> term()), [option()]) :: Outcome.t()
   def execute(%AttemptIdentity{} = identity, deadline_us, fun, opts \\ [])
@@ -53,13 +67,21 @@ defmodule Lasso.Core.Request.RequestOwner do
   defp do_execute(identity, started_us, deadline_us, fun, opts, previous_trap_exit) do
     attempt_ref = make_ref()
     context = AttemptProtocol.new_context(self(), attempt_ref, deadline_us)
+
     caller_guard = Keyword.get(opts, :caller_guard)
     caller_state = caller_state(caller_guard)
     reducer = ExecutionReducer.new(identity, started_us, deadline_us)
 
-    if caller_state.status == :down do
+    abandoned =
+      cond do
+        caller_state.status == :down -> :caller_abandoned
+        shutdown_requested?() -> :owner_shutdown
+        true -> nil
+      end
+
+    if abandoned do
       context
-      |> preflight_cancellation(reducer, started_us)
+      |> preflight_cancellation(reducer, started_us, abandoned)
       |> build_outcome()
     else
       cutoff_token = make_ref()
@@ -136,10 +158,17 @@ defmodule Lasso.Core.Request.RequestOwner do
 
       {:DOWN, caller_ref, :process, caller_pid, _reason}
       when caller_ref == state.caller_monitor and caller_pid == state.caller_pid ->
-        handle_caller_down(state)
+        cancel(state, :caller_abandoned)
 
       {:EXIT, _pid, :normal} when state.previous_trap_exit == false ->
         await_terminal(state)
+
+      # Cowboy stops a request handler with :shutdown once its client connection
+      # closes. Nobody is left to answer, so cancel the attempt like an abandoned
+      # caller and let the handler return instead of exiting mid-attempt.
+      {:EXIT, _pid, reason} when state.previous_trap_exit == false and is_shutdown(reason) ->
+        Process.put(@shutdown_requested, true)
+        cancel(state, :owner_shutdown)
 
       {:EXIT, _pid, reason} when state.previous_trap_exit == false ->
         exit(reason)
@@ -232,7 +261,7 @@ defmodule Lasso.Core.Request.RequestOwner do
     end
   end
 
-  defp handle_caller_down(state) do
+  defp cancel(state, reason) do
     marker = make_ref()
     send(self(), {:request_owner_drain, state.attempt_ref, marker})
     state = close_authorization(state)
@@ -260,7 +289,7 @@ defmodule Lasso.Core.Request.RequestOwner do
                 id: -5,
                 kind: :cancelled,
                 event_us: event_us,
-                reason: :caller_abandoned,
+                reason: reason,
                 certainty: state.gate_snapshot.certainty,
                 censoring_boundary_us: censoring_boundary_us
               }
@@ -426,7 +455,7 @@ defmodule Lasso.Core.Request.RequestOwner do
   defp terminal_observations(terminal_events, gate_snapshot),
     do: AttemptProtocol.gate_observations(terminal_events, gate_snapshot)
 
-  defp preflight_cancellation(context, reducer, event_us) do
+  defp preflight_cancellation(context, reducer, event_us, reason) do
     snapshot = AttemptProtocol.close(context)
 
     reducer =
@@ -436,7 +465,7 @@ defmodule Lasso.Core.Request.RequestOwner do
           id: -7,
           kind: :cancelled,
           event_us: event_us,
-          reason: :caller_abandoned,
+          reason: reason,
           certainty: snapshot.certainty,
           censoring_boundary_us: 0
         }
@@ -446,6 +475,7 @@ defmodule Lasso.Core.Request.RequestOwner do
     %{
       fact: ExecutionReducer.terminal_fact(reducer),
       result: {:error, :caller_abandoned},
+      gate_snapshot: snapshot,
       reducer: reducer
     }
   end
@@ -630,9 +660,7 @@ defmodule Lasso.Core.Request.RequestOwner do
     end
   end
 
-  defp capacity_lease({:ok, %Response.Success{capacity_lease: lease}}), do: lease
-  defp capacity_lease({:ok, %Response.Success{capacity_lease: lease}, _elapsed}), do: lease
-  defp capacity_lease(_result), do: nil
+  defp capacity_lease(result), do: Response.Capacity.lease(result)
 
   defp now_us, do: System.monotonic_time(:microsecond)
 end

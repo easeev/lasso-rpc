@@ -270,6 +270,53 @@ defmodule Lasso.Providers.CandidateListing do
     |> List.first()
   end
 
+  @doc """
+  Selects one provider and retains its unfiltered gate observation on rejection.
+
+  Uses the same reads and filters as `routing_candidate_from_plan/5`, without
+  re-reading gates to reconstruct a failure. A successful result is unchanged;
+  an error contains the observed candidate, not an upstream error or config dump.
+  """
+  @spec routing_candidate_result_from_plan(
+          RoutingPlan.t(),
+          RoutingPlan.provider(),
+          map(),
+          non_neg_integer() | :unavailable,
+          map() | nil
+        ) :: map() | {:error, map()}
+  def routing_candidate_result_from_plan(plan, provider, filters, head, scope) do
+    case do_list_candidates(
+           %{plan | providers: [provider]},
+           filters,
+           :routing,
+           head,
+           false,
+           scope,
+           true
+         ) do
+      {:error, [candidate]} -> {:error, candidate}
+      candidates -> List.first(candidates)
+    end
+  end
+
+  @doc """
+  Retains the existing pass's gate observations only when no route survives.
+
+  Success returns the original candidate list without an evidence wrapper.
+  On exhaustion, the error contains observations captured before exclusion, so
+  the head prefilter can be explained without additional reads. This is not a
+  fallback. Preserves the existing all-lagging fallback and its warning.
+  """
+  @spec routing_candidates_result_from_plan(
+          RoutingPlan.t(),
+          SelectionFilters.t(),
+          non_neg_integer() | :unavailable,
+          map() | nil
+        ) :: [map()] | {:error, [map()]}
+  def routing_candidates_result_from_plan(plan, filters, head, scope) do
+    do_list_candidates(plan, SelectionFilters.to_map(filters), :routing, head, true, scope, true)
+  end
+
   defp do_list_candidates(%RoutingPlan{} = plan, filters),
     do: do_list_candidates(plan, filters, :full)
 
@@ -282,13 +329,17 @@ defmodule Lasso.Providers.CandidateListing do
   defp do_list_candidates(%RoutingPlan{} = plan, filters, mode, consensus_height, warn_on_lag?),
     do: do_list_candidates(plan, filters, mode, consensus_height, warn_on_lag?, nil)
 
+  defp do_list_candidates(plan, filters, mode, head, warn?, scope),
+    do: do_list_candidates(plan, filters, mode, head, warn?, scope, false)
+
   defp do_list_candidates(
          %RoutingPlan{} = plan,
          filters,
          mode,
          consensus_height,
          warn_on_lag?,
-         learned_scope
+         learned_scope,
+         capture_rejection
        ) do
     protocol = Map.get(filters, :protocol)
     workload_key = filters |> Map.get(:workload_key, :client) |> Workload.normalize()
@@ -297,9 +348,14 @@ defmodule Lasso.Providers.CandidateListing do
     learned_scope =
       learned_scope || AttemptProjection.scope_state(plan.profile, plan.chain_id, plan.generation)
 
+    observed_candidates =
+      Enum.map(
+        plan.providers,
+        &build_candidate(&1, learned_scope, plan, protocol, workload_key, mode)
+      )
+
     gate_candidates =
-      plan.providers
-      |> Enum.map(&build_candidate(&1, learned_scope, plan, protocol, workload_key, mode))
+      observed_candidates
       |> Enum.map(&filter_routing_gate_transports(&1, filters, mode))
       |> Enum.filter(fn c ->
         transport_available?(c, protocol) and
@@ -325,11 +381,14 @@ defmodule Lasso.Providers.CandidateListing do
     # Deferred ranking avoids gate reads on the common path. If head evidence
     # changes the candidate set, resolve the real transport gates before the
     # all-routes availability decision so an open sibling cannot mask fallback.
-    if mode in [:ranked, :fastest_ranked] and candidates != gate_candidates do
-      do_list_candidates(plan, filters, :routing, consensus_height, warn_on_lag?, learned_scope)
-    else
-      candidates
-    end
+    result =
+      if mode in [:ranked, :fastest_ranked] and candidates != gate_candidates do
+        do_list_candidates(plan, filters, :routing, consensus_height, warn_on_lag?, learned_scope)
+      else
+        candidates
+      end
+
+    if capture_rejection and result == [], do: {:error, observed_candidates}, else: result
   end
 
   defp filter_by_method(candidates, _plan, method) when not is_binary(method),

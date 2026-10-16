@@ -173,7 +173,7 @@ defmodule Lasso.Core.Support.GapFiller do
           {:ok, result}
 
         {:error, reason, _ctx} ->
-          {:error, reason}
+          {:error, Response.Capacity.discard(reason, :backfill_consumed)}
 
         other ->
           {:error, {:unexpected_request_result, other}}

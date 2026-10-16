@@ -41,10 +41,18 @@ defmodule Lasso.Observability.PrometheusMetrics do
     event_buffer_overflow event_too_large invalid_header invalid_log stale_provider
     message_limit mailbox_limit owner_messages owner_bytes node_capacity contention recipient_down
     released active recovered
-    critical warning available unavailable not_found)
+    critical warning available unavailable not_found
+    no_candidates providers_exhausted candidate_budget_exhausted dispatch_budget_exhausted
+    admission_unavailable chain_identity_rejected breaker_receipt_stale
+    breaker_admission_timeout breaker_unavailable
+    routing_configuration_changed no_providers_configured providers_excluded
+    transport_unavailable archive_required no_eligible_providers)
 
   @route_labels [:profile, :chain, :provider, :method, :transport, :origin, :outcome]
   @definitions [
+    {"lasso_rpc_diagnostic_outcomes_total", :counter,
+     "Diagnostic routing outcomes; successful detail is sampled"},
+    {"lasso_routing_selection_exhausted_total", :counter, "Exhausted routing selection phases"},
     {"lasso_rpc_request_duration_seconds", :histogram,
      "Routed completion duration, including failovers"},
     {"lasso_upstream_attempts_total", :counter,
@@ -72,6 +80,8 @@ defmodule Lasso.Observability.PrometheusMetrics do
      "Managed upstream credential health transitions"}
   ]
   @events [
+    [:lasso, :rpc, :request, :terminal],
+    [:lasso, :routing, :selection_exhausted],
     [:lasso, :rpc, :request, :stop],
     [:lasso, :rpc, :attempt, :terminal],
     [:lasso, :circuit_breaker, :open],
@@ -151,6 +161,22 @@ defmodule Lasso.Observability.PrometheusMetrics do
     _kind, _reason ->
       count_invalid()
       :ok
+  end
+
+  defp observe([:lasso, :rpc, :request, :terminal], _ms, meta) do
+    counter("lasso_rpc_diagnostic_outcomes_total",
+      result: enum(meta[:result]),
+      exhaustion_cause: enum(meta[:exhaustion_cause])
+    )
+  end
+
+  defp observe([:lasso, :routing, :selection_exhausted], _ms, meta) do
+    counter("lasso_routing_selection_exhausted_total",
+      reason: enum(meta[:reason]),
+      profile: identity(meta[:profile]),
+      chain: chain(meta),
+      fallback: to_string(meta[:fallback] == true)
+    )
   end
 
   defp observe([:lasso, :rpc, :request, :stop], ms, meta) do

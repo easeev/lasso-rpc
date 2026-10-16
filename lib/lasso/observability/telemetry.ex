@@ -74,6 +74,16 @@ defmodule Lasso.Telemetry do
       ),
 
       # RPC request counts
+      counter("lasso.rpc.diagnostic_outcome.count",
+        event_name: [:lasso, :rpc, :request, :terminal],
+        description: "Diagnostic routing outcomes; successful detail is sampled",
+        tags: [:result, :exhaustion_cause]
+      ),
+      counter("lasso.routing.selection_exhausted.count",
+        event_name: [:lasso, :routing, :selection_exhausted],
+        description: "Exhausted routing selection phases",
+        tags: [:reason, :profile, :chain_id, :fallback]
+      ),
       counter("lasso.rpc.request.count",
         event_name: [:lasso, :rpc, :request, :stop],
         description: "RPC request count",

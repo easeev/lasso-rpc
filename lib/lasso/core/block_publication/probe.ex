@@ -79,7 +79,8 @@ defmodule Lasso.BlockPublication.Probe do
           Success.release_capacity(response, :block_publication_consumed)
         end
 
-      {:error, _, _} ->
+      {:error, error, _} ->
+        Lasso.RPC.Response.Capacity.release(error, :block_publication_consumed)
         {:error, :provider_unavailable}
     end
   end

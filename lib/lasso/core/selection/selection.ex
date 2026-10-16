@@ -79,7 +79,7 @@ defmodule Lasso.RPC.Selection do
       {:ok, snapshot, plan} ->
         do_select_provider(snapshot, plan, method, params, selection_opts)
 
-      :unavailable ->
+      {:unavailable, _} ->
         {:error, :no_providers_available}
     end
   end
@@ -175,13 +175,13 @@ defmodule Lasso.RPC.Selection do
       when is_binary(profile) and is_integer(chain_id) and chain_id > 0 and is_binary(method) do
     case capture_selection_snapshot(profile, chain_id) do
       {:ok, snapshot, plan} -> select_channels_from_plan(snapshot, plan, method, opts)
-      :unavailable -> []
+      {:unavailable, _} -> []
     end
   end
 
   @doc false
   @spec select_channel_candidates(String.t(), pos_integer(), String.t(), keyword()) ::
-          [Channel.t()] | CandidateCursor.t()
+          [Channel.t()] | CandidateCursor.t() | {:unavailable, map()}
   def select_channel_candidates(profile, chain_id, method, opts)
       when is_binary(profile) and is_integer(chain_id) and chain_id > 0 and is_binary(method) do
     strategy = Keyword.get(opts, :strategy, :load_balanced)
@@ -191,7 +191,7 @@ defmodule Lasso.RPC.Selection do
       {strategy, _module} when strategy in [:priority, :load_balanced] ->
         case capture_selection_snapshot(profile, chain_id) do
           {:ok, snapshot, plan} -> CandidateCursor.new(snapshot, plan, method, opts)
-          :unavailable -> []
+          {:unavailable, _} = failure -> failure
         end
 
       {:fastest, Lasso.RPC.Strategies.Fastest} ->
@@ -305,8 +305,8 @@ defmodule Lasso.RPC.Selection do
             )
         end
 
-      :unavailable ->
-        []
+      {:unavailable, _} = failure ->
+        failure
     end
   end
 
@@ -1084,24 +1084,31 @@ defmodule Lasso.RPC.Selection do
   end
 
   defp capture_selection_snapshot(profile, chain_id) do
-    case Catalog.snapshot() do
-      %{generation: generation} = snapshot ->
-        with true <- ConfigStore.route_generation() == generation,
-             {:ok, plan} <- Catalog.get_routing_plan(snapshot, profile, chain_id) do
-          {:ok, snapshot, plan}
-        else
-          _unavailable -> :unavailable
+    snapshot = Catalog.snapshot()
+
+    case snapshot do
+      %{generation: generation} ->
+        case Catalog.get_routing_plan(snapshot, profile, chain_id) do
+          {:ok, %RoutingPlan{generation: ^generation} = plan} -> {:ok, snapshot, plan}
+          {:ok, _} -> selection_unavailable(snapshot, :plan_generation_mismatch)
+          _ -> selection_unavailable(snapshot, :plan_unavailable)
         end
 
-      _unavailable ->
-        :unavailable
+      _ ->
+        selection_unavailable(snapshot, :unavailable)
     end
   end
 
-  defp selection_snapshot_current?(snapshot),
-    do:
-      Catalog.snapshot() == snapshot and
-        ConfigStore.route_generation() == snapshot.generation
+  defp selection_unavailable(snapshot, reason) do
+    {:unavailable,
+     %{
+       catalog_generation: snapshot && snapshot.generation,
+       config_generation: ConfigStore.route_generation(),
+       catalog_status: reason
+     }}
+  end
+
+  defp selection_snapshot_current?(snapshot), do: Catalog.snapshot() == snapshot
 
   defp selection_snapshot_current?(snapshot, candidates) do
     Enum.all?(candidates, &(&1.route_generation == snapshot.generation)) and

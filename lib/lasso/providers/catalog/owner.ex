@@ -31,11 +31,16 @@ defmodule Lasso.Providers.Catalog.Owner do
   @doc """
   Rebuilds the catalog from current `ConfigStore` state.
 
-  Synchronous: the caller blocks until the new table is published.
+  Synchronous: the caller blocks until the new table is published. A failed
+  build discards its candidate and raises in the caller; the owner and the
+  previously published table remain alive.
   """
   @spec rebuild() :: :ok
   def rebuild do
-    GenServer.call(__MODULE__, :rebuild, :infinity)
+    case GenServer.call(__MODULE__, :rebuild, :infinity) do
+      :ok -> :ok
+      {:raised, kind, reason, stacktrace} -> :erlang.raise(kind, reason, stacktrace)
+    end
   end
 
   ## GenServer callbacks
@@ -66,7 +71,9 @@ defmodule Lasso.Providers.Catalog.Owner do
             Logger.info("Catalog.Owner self-healed catalog after a crash restart")
           rescue
             e ->
-              Logger.warning("Catalog.Owner self-heal failed: " <> Exception.message(e))
+              message = Exception.message(e)
+              Logger.warning("Catalog.Owner self-heal failed: " <> message)
+              emit_rebuild_failed(:crash_recovery, message)
               Process.send_after(self(), :retry_self_heal_catalog, 1_000)
           end
         end
@@ -79,6 +86,16 @@ defmodule Lasso.Providers.Catalog.Owner do
   def handle_call(:rebuild, _from, state) do
     do_rebuild()
     {:reply, :ok, state}
+  catch
+    kind, reason ->
+      # Only the unpublished candidate is discarded by do_rebuild. The
+      # owner and its last coherent table must survive malformed config.
+      Logger.warning("Catalog rebuild failed; retaining published snapshot",
+        failure_kind: kind
+      )
+
+      emit_rebuild_failed(:config_change, Exception.format_banner(kind, reason))
+      {:reply, {:raised, kind, reason, __STACKTRACE__}, state}
   end
 
   @impl true
@@ -99,28 +116,48 @@ defmodule Lasso.Providers.Catalog.Owner do
 
   def handle_info({:catalog_publication_continue, _ref, _phase}, state), do: {:noreply, state}
 
+  defp emit_rebuild_failed(trigger, message) do
+    :telemetry.execute([:lasso, :provider_catalog, :rebuild_failed], %{count: 1}, %{
+      trigger: trigger,
+      message: message
+    })
+  end
+
   defp do_rebuild do
     new_table = :ets.new(:lasso_provider_catalog, [:public, :set, read_concurrency: true])
 
     try do
       generation = ConfigStore.route_generation()
-      Catalog.populate(new_table, generation)
+      :ok = Catalog.populate(new_table, generation)
       publication_barrier(:after_catalog_populate, generation)
       continue_rebuild(new_table, generation)
     catch
       kind, reason ->
+        stacktrace = __STACKTRACE__
         if :ets.info(new_table, :owner) == self(), do: :ets.delete(new_table)
-        :erlang.raise(kind, reason, __STACKTRACE__)
+        restore_published_routes()
+        :erlang.raise(kind, reason, stacktrace)
     end
   end
 
   defp continue_rebuild(new_table, generation) do
     if ConfigStore.route_generation() == generation do
       routes = Catalog.routing_control_routes(new_table)
-      AttemptProjection.reconcile_routes(generation, routes)
+      # Finish all candidate derivation before changing shared control rows.
+      plans = Catalog.routing_plans(new_table)
+      aggregates = RequestAggregate.prepare(generation, plans, Catalog.snapshot())
+      heads = Catalog.head_scopes_by_instance(plans)
+
+      snapshot = %{
+        table: new_table,
+        generation: generation,
+        routing_plans: plans,
+        request_aggregates: aggregates,
+        head_scopes_by_instance: heads
+      }
 
       if ConfigStore.route_generation() == generation do
-        finish_rebuild(new_table, generation, routes)
+        finish_rebuild(new_table, generation, routes, snapshot)
       else
         retry_rebuild(new_table)
       end
@@ -129,53 +166,52 @@ defmodule Lasso.Providers.Catalog.Owner do
     end
   end
 
-  defp finish_rebuild(new_table, generation, routes) do
-    unless AttemptProjection.routes_ready?(generation, routes) do
-      :ets.delete(new_table)
-      raise "routing control publication was incomplete"
-    end
-
-    publication_barrier(:after_control_populate, generation)
-
+  defp finish_rebuild(new_table, generation, routes, snapshot) do
     if ConfigStore.route_generation() != generation do
-      :ets.delete(new_table)
-      do_rebuild()
+      retry_rebuild(new_table)
     else
-      routing_plans = Catalog.routing_plans(new_table)
-      publication_barrier(:before_pointer_swap, generation)
+      AttemptProjection.reconcile_routes(generation, routes)
 
-      if ConfigStore.route_generation() != generation do
-        :ets.delete(new_table)
-        do_rebuild()
+      unless AttemptProjection.routes_ready?(generation, routes),
+        do: raise("routing control publication was incomplete")
+
+      publication_barrier(:after_control_populate, generation)
+
+      if ConfigStore.route_generation() == generation do
+        publication_barrier(:before_pointer_swap, generation)
+
+        if ConfigStore.route_generation() == generation,
+          do: publish(snapshot),
+          else: retry_rebuild(new_table)
       else
-        publish(new_table, generation, routing_plans)
+        retry_rebuild(new_table)
       end
     end
   end
 
+  defp restore_published_routes do
+    case Catalog.snapshot() do
+      %{table: table, generation: generation} ->
+        # A cold owner restart has no retained live catalog to restore.
+        if :ets.info(table, :size) != :undefined do
+          AttemptProjection.reconcile_routes(generation, Catalog.routing_control_routes(table))
+        end
+
+      nil ->
+        :ok
+    end
+  end
+
   defp retry_rebuild(new_table) do
+    restore_published_routes()
     :ets.delete(new_table)
     do_rebuild()
   end
 
-  defp publish(new_table, generation, routing_plans) do
-    key = Catalog.persistent_term_key()
-    previous_snapshot = Catalog.snapshot()
+  defp publish(snapshot) do
     old_table = Catalog.table()
-    request_aggregates = RequestAggregate.prepare(generation, routing_plans, previous_snapshot)
-    head_scopes_by_instance = Catalog.head_scopes_by_instance(routing_plans)
-
-    snapshot = %{
-      table: new_table,
-      generation: generation,
-      routing_plans: routing_plans,
-      head_scopes_by_instance: head_scopes_by_instance,
-      request_aggregates: request_aggregates
-    }
-
-    :persistent_term.put(key, snapshot)
+    :persistent_term.put(Catalog.persistent_term_key(), snapshot)
     Lasso.BlockSync.Registry.clear_scoped_head_snapshots()
-
     if old_table, do: Process.send_after(self(), {:delete_table, old_table}, @grace_period_ms)
     :ok
   end

@@ -161,21 +161,25 @@ defmodule LassoWeb.RPCController do
         # Inject observability metadata for errors with context
         conn = maybe_inject_observability_metadata(conn, ctx)
 
-        if notification_request?(params) do
-          send_resp(conn, 204, "")
-        else
-          error_response =
-            error
-            |> JError.from()
-            |> JError.to_response(Map.get(params, "id"))
+        try do
+          if notification_request?(params) do
+            send_resp(conn, 204, "")
+          else
+            error_response =
+              error
+              |> JError.from()
+              |> JError.to_response(Map.get(params, "id"))
 
-          error_response =
-            case conn.assigns[:include_meta] do
-              :body -> ObservabilityPlug.enrich_response_body(error_response, ctx)
-              _ -> error_response
-            end
+            error_response =
+              case conn.assigns[:include_meta] do
+                :body -> ObservabilityPlug.enrich_response_body(error_response, ctx)
+                _ -> error_response
+              end
 
-          json(conn, error_response)
+            json(conn, error_response)
+          end
+        after
+          release_response_capacity(error, :error_sent)
         end
 
       {:invalid, error, response_id} ->
@@ -520,10 +524,8 @@ defmodule LassoWeb.RPCController do
     end
   end
 
-  defp release_response_capacity(%Response.Success{} = response, reason),
-    do: Response.Success.release_capacity(response, reason)
-
-  defp release_response_capacity(_response, _reason), do: :ok
+  defp release_response_capacity(response, reason),
+    do: Response.Capacity.release(response, reason)
 
   defp validate_json_rpc_request(request), do: RequestValidator.validate(request)
 

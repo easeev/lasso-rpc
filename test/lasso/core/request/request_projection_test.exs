@@ -33,11 +33,13 @@ defmodule Lasso.RPC.RequestProjectionTest do
         %{
           provider_id: oversized,
           instance_id: oversized,
-          transport: :http
+          transport: :http,
+          exhaustion_cause: :circuit_open
         },
         2
       )
 
+    assert event.exhaustion_cause == :circuit_open
     assert event.method == BoundedIdentifier.encode(oversized)
     assert event.provider_id == BoundedIdentifier.encode(oversized)
     assert event.instance_id == BoundedIdentifier.encode(oversized)
@@ -77,9 +79,9 @@ defmodule Lasso.RPC.RequestProjectionTest do
 
     assert {:ok, native_payload} = RequestProjection.encode(event)
 
-    assert {:lasso_request_projection, 1, compact_fact, _method, _provider_id, _instance_id,
-            _transport, _origin, _failovers,
-            _emitted_at_ms} =
+    assert {:lasso_request_projection, 2, compact_fact, _method, _provider_id, _instance_id,
+            _transport, _origin, _failovers, _emitted_at_ms,
+            nil} =
              :erlang.binary_to_term(native_payload, [:safe])
 
     assert elem(compact_fact, 0) == :compact_success_v1
@@ -247,8 +249,9 @@ defmodule Lasso.RPC.RequestProjectionTest do
 
     assert {:ok, payload} = RequestProjection.encode(event)
 
-    assert {:lasso_request_projection, 1, %RequestTerminal.UpstreamResponse{}, _, _, _, _, _, _,
-            _} =
+    assert {:lasso_request_projection, 2, %RequestTerminal.UpstreamResponse{}, _, _, _, _, _, _,
+            _,
+            nil} =
              :erlang.binary_to_term(payload, [:safe])
 
     assert {:ok, ^event} = RequestProjection.decode(payload)
@@ -258,8 +261,8 @@ defmodule Lasso.RPC.RequestProjectionTest do
     event = request_projection()
     assert {:ok, payload} = RequestProjection.encode(event)
 
-    {:lasso_request_projection, 1, compact_fact, method, provider_id, instance_id, transport,
-     origin, failovers, emitted_at_ms} = :erlang.binary_to_term(payload, [:safe])
+    {:lasso_request_projection, 2, compact_fact, method, provider_id, instance_id, transport,
+     origin, failovers, emitted_at_ms, nil} = :erlang.binary_to_term(payload, [:safe])
 
     payload =
       :erlang.term_to_binary(

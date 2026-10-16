@@ -21,7 +21,8 @@ defmodule Lasso.RPC.RequestPipeline do
 
   require Logger
 
-  alias Lasso.Config.{ConfigStore, MethodConstraints, ProfileValidator}
+  alias Lasso.RPC.Response.Capacity
+  alias Lasso.Config.{MethodConstraints, ProfileValidator}
   alias Lasso.Core.Request.{ExecutionScope, RequestOwner}
   alias Lasso.Core.Support.CircuitBreaker
   alias Lasso.Core.Support.CircuitBreaker.AdmissionReceipt
@@ -51,7 +52,7 @@ defmodule Lasso.RPC.RequestPipeline do
   alias Lasso.RPC.RequestOptions
   alias Lasso.RPC.Response.Success
   alias Lasso.RPC.RoutingEvidence.Workload
-  alias Lasso.RPC.Selection.Exploration
+  alias Lasso.RPC.Selection.{Exhaustion, Exploration}
 
   # Type definitions
   @type chain_id :: pos_integer()
@@ -60,11 +61,18 @@ defmodule Lasso.RPC.RequestPipeline do
   @type result :: {:ok, any(), RequestContext.t()} | {:error, JError.t(), RequestContext.t()}
 
   # A channel source is a function that returns channels to try
-  @type candidates :: [Channel.t()] | CandidateCursor.t()
+  @type candidates :: [Channel.t()] | CandidateCursor.t() | {:unavailable, map()}
   @type channel_source :: (RequestContext.t() -> candidates())
 
   # Configuration
   @max_channel_candidates 10
+  @admission_causes [
+    :chain_identity_rejected,
+    :breaker_receipt_stale,
+    :breaker_admission_timeout,
+    :breaker_unavailable,
+    :circuit_open
+  ]
 
   @doc """
   Execute an RPC request using transport-agnostic channels.
@@ -300,7 +308,7 @@ defmodule Lasso.RPC.RequestPipeline do
         :ok ->
           case selected do
             nil ->
-              handle_no_channels(ctx, selection_exhaustion_reason(candidates))
+              handle_no_channels(ctx, selection_exhaustion_reason(remaining), remaining)
 
             %Channel{} = channel ->
               ctx = RequestContext.mark_upstream_start(ctx)
@@ -311,6 +319,14 @@ defmodule Lasso.RPC.RequestPipeline do
           finalize_caller_abandoned(ctx)
 
         {:error, :deadline_exhausted} ->
+          if is_nil(selected),
+            do:
+              Exhaustion.log_failure(
+                ctx,
+                remaining,
+                :deadline_exhausted
+              )
+
           finalize_bounded_error(ctx, :deadline_exhausted)
       end
     after
@@ -420,7 +436,7 @@ defmodule Lasso.RPC.RequestPipeline do
   end
 
   defp do_attempt_channels(%CandidateCursor{} = cursor, ctx, param_rejected, caller_guard) do
-    case CandidateCursor.next(cursor) do
+    case CandidateCursor.next_with_evidence(cursor) do
       {:ok, channel, rest} ->
         do_attempt_channels(
           [channel],
@@ -430,7 +446,7 @@ defmodule Lasso.RPC.RequestPipeline do
           rest
         )
 
-      result when result in [:done, :stale] ->
+      {result, _remaining} when result in [:done, :stale] ->
         do_attempt_channels([], ctx, param_rejected, caller_guard)
     end
   end
@@ -512,15 +528,19 @@ defmodule Lasso.RPC.RequestPipeline do
     end
   end
 
+  defp pop_candidate({:unavailable, _} = failure), do: {nil, failure}
+
   defp pop_candidate([%Channel{} = channel | rest]), do: {channel, rest}
   defp pop_candidate([]), do: {nil, []}
 
   defp pop_candidate(%CandidateCursor{} = cursor) do
-    case CandidateCursor.next(cursor) do
+    case CandidateCursor.next_with_evidence(cursor) do
       {:ok, channel, remaining} -> {channel, remaining}
-      result when result in [:done, :stale] -> {nil, []}
+      {result, remaining} when result in [:done, :stale] -> {nil, remaining}
     end
   end
+
+  defp candidate_labels({:unavailable, _}, _selected), do: []
 
   defp candidate_labels(channels, _selected) when is_list(channels),
     do: Enum.map(channels, &"#{&1.provider_id}:#{&1.transport}")
@@ -676,7 +696,7 @@ defmodule Lasso.RPC.RequestPipeline do
 
         attempt_channels(
           rest_channels,
-          %{ctx | terminal_reason: :admission_unavailable},
+          %{ctx | terminal_reason: :chain_identity_rejected},
           [],
           caller_guard
         )
@@ -811,6 +831,8 @@ defmodule Lasso.RPC.RequestPipeline do
        ) do
     timeout_ms = max(div(attempt_deadline_us - System.monotonic_time(:microsecond), 1_000), 1)
 
+    ctx = retire_last_error(ctx, :retry_started)
+
     outcome =
       Lasso.Observability.Tracing.attempt(channel, ctx, fn ->
         RequestOwner.execute(
@@ -837,7 +859,9 @@ defmodule Lasso.RPC.RequestPipeline do
 
     _projection_result =
       AttemptProjection.process(
-        AttemptProjection.new(outcome.fact, channel.provider_id, ctx.method, qualification)
+        AttemptProjection.new(outcome.fact, channel.provider_id, ctx.method, qualification),
+        Lasso.ExecutionProjectionDispatcher,
+        identity.upstream_instance_id
       )
 
     ctx = commit_attempt_context(ctx, channel, identity.upstream_instance_id, outcome)
@@ -867,7 +891,7 @@ defmodule Lasso.RPC.RequestPipeline do
     ctx =
       ctx
       |> Map.put(:execution_envelope, envelope)
-      |> Map.put(:terminal_reason, :admission_unavailable)
+      |> Map.put(:terminal_reason, :breaker_receipt_stale)
       |> RequestContext.increment_retries()
 
     attempt_channels(rest_channels, ctx, [], caller_guard)
@@ -913,7 +937,7 @@ defmodule Lasso.RPC.RequestPipeline do
 
     attempt_channels(
       rest_channels,
-      %{ctx | terminal_reason: :admission_unavailable},
+      %{ctx | terminal_reason: :breaker_admission_timeout},
       [],
       caller_guard
     )
@@ -935,7 +959,7 @@ defmodule Lasso.RPC.RequestPipeline do
 
     attempt_channels(
       rest_channels,
-      %{ctx | terminal_reason: :admission_unavailable},
+      %{ctx | terminal_reason: :breaker_unavailable},
       [],
       caller_guard
     )
@@ -1269,7 +1293,7 @@ defmodule Lasso.RPC.RequestPipeline do
 
     attempt_channels(
       rest_channels,
-      %{ctx | terminal_reason: :admission_unavailable},
+      %{ctx | terminal_reason: :circuit_open},
       [],
       caller_guard
     )
@@ -1280,8 +1304,9 @@ defmodule Lasso.RPC.RequestPipeline do
 
   defp selection_exhaustion_reason(_candidates), do: :no_eligible_providers
 
-  @spec handle_no_channels(RequestContext.t(), atom()) :: result()
-  defp handle_no_channels(ctx, reason) do
+  @spec handle_no_channels(RequestContext.t(), atom(), candidates()) :: result()
+  defp handle_no_channels(ctx, reason, candidates) do
+    Exhaustion.record(ctx, candidates, reason)
     profile = if ctx.opts, do: ctx.opts.profile, else: ProfileValidator.default_profile()
 
     retry_after_ms =
@@ -1329,7 +1354,7 @@ defmodule Lasso.RPC.RequestPipeline do
       retry_after_ms: retry_after_ms
     )
 
-    finalize_error(jerr, %{ctx | terminal_reason: :providers_exhausted})
+    finalize_error(jerr, %{ctx | terminal_reason: :no_candidates})
   end
 
   defp block_sync_log_level(ctx, default \\ :info) do
@@ -1339,8 +1364,25 @@ defmodule Lasso.RPC.RequestPipeline do
     end
   end
 
+  defp retire_last_error(%{last_attempt_error: %JError{} = error} = ctx, reason) do
+    %{ctx | last_attempt_error: Capacity.discard(error, reason)}
+  end
+
+  defp retire_last_error(ctx, _reason), do: ctx
+
   @spec finalize_error(JError.t(), RequestContext.t()) :: result()
   defp finalize_error(jerr, ctx) do
+    previous = ctx.last_attempt_error
+
+    if Capacity.lease(previous) != Capacity.lease(jerr),
+      do: Capacity.release(previous, :translated_or_replaced)
+
+    ctx = %{
+      ctx
+      | last_attempt_error:
+          if(match?(%JError{}, previous), do: JError.summary(previous), else: previous)
+    }
+
     ctx =
       ctx
       |> RequestContext.mark_upstream_end()
@@ -1362,7 +1404,7 @@ defmodule Lasso.RPC.RequestPipeline do
 
   defp request_open(ctx, caller_guard) do
     cond do
-      not ExecutionScope.caller_alive?(caller_guard) ->
+      RequestOwner.shutdown_requested?() or not ExecutionScope.caller_alive?(caller_guard) ->
         {:error, :caller_abandoned}
 
       System.monotonic_time(:microsecond) >= ctx.execution_envelope.deadline_us ->
@@ -1379,6 +1421,9 @@ defmodule Lasso.RPC.RequestPipeline do
     do: [caller_guard: caller_guard]
 
   defp finalize_bounded_error(ctx, reason) do
+    if reason == :deadline_exhausted and is_nil(ctx.selection_start),
+      do: Exhaustion.log_failure(ctx, [], reason)
+
     {message, category} =
       case reason do
         :deadline_exhausted ->
@@ -1436,7 +1481,11 @@ defmodule Lasso.RPC.RequestPipeline do
       RequestProjection.record_and_enqueue(
         request_terminal,
         ctx.method,
-        request_projection_route(ctx),
+        Map.put(
+          request_projection_route(ctx) || %{},
+          :exhaustion_cause,
+          exhaustion_cause(request_terminal, ctx)
+        ),
         ctx.retries,
         ctx.opts.request_origin
       )
@@ -1471,9 +1520,10 @@ defmodule Lasso.RPC.RequestPipeline do
         _status,
         _value,
         %RequestContext{
-          terminal_attempt_fact: %AttemptTerminal.Cancelled{reason: :caller_abandoned}
+          terminal_attempt_fact: %AttemptTerminal.Cancelled{reason: reason}
         } = ctx
-      ) do
+      )
+      when reason in [:caller_abandoned, :owner_shutdown] do
     RequestTerminal.CallerAbandonment.new(
       request_terminal_attrs(ctx),
       ctx.request_dispatch_certainty
@@ -1592,7 +1642,16 @@ defmodule Lasso.RPC.RequestPipeline do
             ],
        do: reason
 
+  defp final_exhaustion_reason(%RequestContext{terminal_reason: reason})
+       when reason in @admission_causes,
+       do: :admission_unavailable
+
   defp final_exhaustion_reason(_ctx), do: :providers_exhausted
+
+  defp exhaustion_cause(%RequestTerminal.OrdinaryExhaustion{}, ctx),
+    do: ctx.terminal_reason || :providers_exhausted
+
+  defp exhaustion_cause(_terminal, _ctx), do: nil
 
   defp request_workload_key(%RequestContext{public_response_attempt: fact})
        when not is_nil(fact) do
@@ -1623,6 +1682,11 @@ defmodule Lasso.RPC.RequestPipeline do
         params: [],
         rpc_request: nil,
         prepared_request: nil,
+        last_attempt_error:
+          if(match?(%JError{}, ctx.last_attempt_error),
+            do: JError.summary(ctx.last_attempt_error),
+            else: ctx.last_attempt_error
+          ),
         opts: opts
     }
   end
@@ -1707,10 +1771,9 @@ defmodule Lasso.RPC.RequestPipeline do
               not is_nil(channel),
               do: channel
 
-        if Catalog.snapshot() == snapshot and
-             ConfigStore.route_generation() == snapshot.generation,
-           do: channels,
-           else: []
+        if Catalog.snapshot() == snapshot,
+          do: channels,
+          else: []
 
       _unavailable ->
         []
@@ -1730,12 +1793,11 @@ defmodule Lasso.RPC.RequestPipeline do
 
   defp active_catalog_provider(profile, chain_id, provider_id) do
     with %{generation: generation} = snapshot <- Catalog.snapshot(),
-         true <- generation == ConfigStore.route_generation(),
-         {:ok, plan} <- Catalog.get_routing_plan(snapshot, profile, chain_id),
+         {:ok, %Lasso.RPC.RoutingPlan{generation: ^generation} = plan} <-
+           Catalog.get_routing_plan(snapshot, profile, chain_id),
          provider when not is_nil(provider) <-
            Enum.find(plan.providers, &(&1.id == provider_id)),
-         true <- Catalog.snapshot() == snapshot,
-         true <- ConfigStore.route_generation() == generation do
+         true <- Catalog.snapshot() == snapshot do
       {:ok, snapshot, provider, provider.config}
     else
       _unavailable -> {:error, :not_found}

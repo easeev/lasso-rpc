@@ -66,7 +66,12 @@ defmodule LassoWeb.RPCSocket.ItemOwner do
 
         result = execute(work, scope, socket_pid, context, opts)
 
-        send(socket_pid, {:rpc_item_result, item_ref, self(), result})
+        Lasso.RPC.Response.Capacity.deliver(
+          result,
+          socket_pid,
+          item_ref,
+          {:rpc_item_result, item_ref, self(), result}
+        )
       end)
     )
   catch

@@ -5,7 +5,7 @@ defmodule Lasso.RPC.RequestPipelineChainIdentityTest do
 
   alias Lasso.Core.Support.CircuitBreaker.Snapshot
   alias Lasso.Providers.{Catalog, ChainIdentity}
-  alias Lasso.RPC.{RequestOptions, RequestPipeline}
+  alias Lasso.RPC.{RequestOptions, RequestPipeline, RequestTerminal}
 
   defmodule PausedSelection do
     @behaviour Lasso.RPC.Strategy
@@ -63,9 +63,12 @@ defmodule Lasso.RPC.RequestPipelineChainIdentityTest do
     id = Catalog.lookup_instance_id("public", chain, "selected")
     ChainIdentity.record(ChainIdentity.capture(id, Catalog.snapshot()), :rejected)
     send(owner, :resume_identity_selection)
-    assert {:error, _, ctx} = Task.await(task)
+    assert {:error, error, ctx} = Task.await(task)
     assert ctx.execution_envelope.dispatch_count == 0
-    assert ctx.terminal_reason == :admission_unavailable
+    assert ctx.terminal_reason == :chain_identity_rejected
+
+    assert %RequestTerminal.OrdinaryExhaustion{reason: :admission_unavailable} =
+             RequestPipeline.build_request_terminal(:error, error, ctx)
   end
 
   test "never-observed identity preserves admission", %{chain: chain} do
@@ -82,9 +85,13 @@ defmodule Lasso.RPC.RequestPipelineChainIdentityTest do
     assert {:ok, %{state: :closed} = breaker} = Snapshot.lookup({id, :http})
 
     ChainIdentity.record(ChainIdentity.capture(id, snapshot), :rejected)
-    assert {:error, _, ctx} = request(chain, "identity-provider")
+    assert {:error, error, ctx} = request(chain, "identity-provider")
     assert ctx.execution_envelope.dispatch_count == 0
-    assert ctx.terminal_reason == :admission_unavailable
+    assert ctx.terminal_reason == :chain_identity_rejected
+
+    assert %RequestTerminal.OrdinaryExhaustion{reason: :admission_unavailable} =
+             RequestPipeline.build_request_terminal(:error, error, ctx)
+
     assert Snapshot.lookup({id, :http}) == {:ok, breaker}
 
     ChainIdentity.record(ChainIdentity.capture(id, snapshot), :verified)

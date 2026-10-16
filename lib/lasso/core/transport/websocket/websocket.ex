@@ -263,6 +263,9 @@ defmodule Lasso.RPC.Transports.WebSocket do
           {:ok, %Response.Success{capacity_lease: ^lease}} = retained ->
             retained
 
+          {:error, %JError{capacity_lease: ^lease}} = retained ->
+            retained
+
           other ->
             UpstreamAdmission.release(lease, :request_finished)
             other
@@ -482,7 +485,7 @@ defmodule Lasso.RPC.Transports.WebSocket do
 
     case finalized do
       {:ok, response} ->
-        case retain_response(response, response_lease, context) do
+        case retain_response(response, response_lease, context, byte_size(raw_bytes)) do
           {:ok, retained_response} ->
             AttemptProtocol.terminal_at(
               context,
@@ -514,31 +517,53 @@ defmodule Lasso.RPC.Transports.WebSocket do
           ErrorClassifier.resolve(
             error.code,
             error.message,
-            [data: error.data, provider_id: provider_id] ++ Map.to_list(classification_context)
+            [data: error.data, provider_id: provider_id, emit?: false] ++
+              Map.to_list(classification_context)
           )
 
-        AttemptProtocol.terminal_at(
-          context,
-          :response,
-          %{
-            response_kind: :error,
-            error_code: error.code,
-            error_category: resolution.control_category,
-            io_duration_us: io_duration_us
-          },
-          validated_at_us
-        )
+        error = %{
+          error
+          | provider_id: provider_id,
+            transport: :ws,
+            category: resolution.category,
+            retriable?: resolution.retriable?,
+            breaker_penalty?: resolution.breaker_penalty?,
+            resolution: resolution
+        }
 
-        {:error,
-         %{
-           error
-           | provider_id: provider_id,
-             transport: :ws,
-             category: resolution.category,
-             retriable?: resolution.retriable?,
-             breaker_penalty?: resolution.breaker_penalty?,
-             resolution: resolution
-         }}
+        case retain_response(error, response_lease, context, byte_size(raw_bytes)) do
+          {:ok, error} ->
+            :ok = ErrorClassifier.observe(resolution, error.message, error.data)
+
+            AttemptProtocol.terminal_at(
+              context,
+              :response,
+              %{
+                response_kind: :error,
+                error_code: error.code,
+                error_category: resolution.control_category,
+                io_duration_us: io_duration_us
+              },
+              validated_at_us
+            )
+
+            {:error, error}
+
+          {:error, reason} ->
+            AttemptProtocol.terminal_at(
+              context,
+              :response,
+              %{
+                response_kind: :error,
+                error_code: -32_005,
+                error_category: :local_capacity_rejection,
+                io_duration_us: io_duration_us
+              },
+              validated_at_us
+            )
+
+            {:error, normalize_ws_error({:response_limit, reason}, provider_id)}
+        end
 
       {:invalid, reason} ->
         AttemptProtocol.terminal_at(
@@ -560,16 +585,14 @@ defmodule Lasso.RPC.Transports.WebSocket do
     end
   end
 
-  defp retain_response(response, lease, nil) do
-    UpstreamAdmission.release(lease, :untracked_response)
-    {:ok, response}
-  end
+  defp retain_response(response, lease, context, wire_bytes) do
+    owner =
+      case context do
+        %AttemptProtocol.Context{owner: owner} -> owner
+        _ -> self()
+      end
 
-  defp retain_response(response, lease, %AttemptProtocol.Context{owner: owner}) do
-    case UpstreamAdmission.transfer(lease, owner) do
-      :ok -> {:ok, %{response | capacity_lease: lease}}
-      {:error, reason} -> {:error, reason}
-    end
+    Response.Capacity.retain(response, lease, owner, wire_bytes)
   end
 
   defp send_error_certainty(:deadline), do: :not_dispatched

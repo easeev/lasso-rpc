@@ -19,6 +19,7 @@ defmodule LassoWeb.RPCSocket do
   @behaviour Phoenix.Socket.Transport
   require Logger
 
+  alias Lasso.RPC.Response.Capacity
   alias Lasso.Config.{ConfigStore, ProfileValidator}
   alias Lasso.Core.Request.ByteBudget
   alias Lasso.JSONRPC.Error, as: JError
@@ -270,9 +271,10 @@ defmodule LassoWeb.RPCSocket do
       %{pid: ^owner_pid} = item ->
         Process.demonitor(item.monitor, [:flush])
         state = remove_forwarded_item(state, item_ref, item)
-        handle_forwarded_result(result, item, state)
+        handle_forwarded_result(Capacity.accept(result, owner_pid, item_ref), item, state)
 
       _missing_or_stale ->
+        Capacity.reject(result, owner_pid, item_ref, :stale_socket_result)
         {:ok, count_item_owner(state, :stale_result)}
     end
   end
@@ -612,6 +614,8 @@ defmodule LassoWeb.RPCSocket do
     else
       {:ok, state}
     end
+  after
+    Capacity.release(result, :websocket_sent)
   end
 
   defp handle_forwarded_result({:error, reason, updated_ctx}, item, state) do
@@ -622,6 +626,8 @@ defmodule LassoWeb.RPCSocket do
     else
       {:ok, state}
     end
+  after
+    Capacity.release(reason, :websocket_error_consumed)
   end
 
   defp handle_forwarded_result(_invalid_result, item, state) do
