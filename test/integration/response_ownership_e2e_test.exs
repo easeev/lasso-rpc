@@ -300,6 +300,70 @@ defmodule Lasso.BackgroundResponseOwnershipE2ETest do
     end
   end
 
+  test "a result is adopted before worker exit, while a killed delivery is rejected", c do
+    baseline = UpstreamAdmission.stats().response_bytes
+    recipient = self()
+
+    opts = %RequestOptions{
+      profile: c.profile,
+      strategy: :priority,
+      transport: :http,
+      provider_override: "primary",
+      failover_on_override: false,
+      timeout_ms: 5_000
+    }
+
+    for outcome <- [:adopt, :kill] do
+      ref = make_ref()
+
+      worker =
+        spawn(fn ->
+          result = RequestPipeline.execute_via_channels(c.chain, "resolution_heap", [], opts)
+          Response.Capacity.deliver(result, recipient, ref, {:delivery, ref, self(), result})
+        end)
+
+      monitor = Process.monitor(worker)
+      assert_receive {:delivery, ^ref, ^worker, result}, 5_000
+      assert UpstreamAdmission.stats().response_bytes > baseline
+
+      if outcome == :adopt do
+        assert {:error, error, _} = Response.Capacity.accept(result, worker, ref)
+        assert_receive {:DOWN, ^monitor, :process, ^worker, :normal}
+        assert UpstreamAdmission.stats().response_bytes > baseline
+        assert :ok = Response.Capacity.release(error, :downstream_consumed)
+      else
+        Process.exit(worker, :kill)
+        assert_receive {:DOWN, ^monitor, :process, ^worker, :killed}
+        await(fn -> UpstreamAdmission.stats().response_bytes == baseline end)
+        assert {:error, :response_handoff_failed} = Response.Capacity.accept(result, worker, ref)
+      end
+
+      await(fn -> UpstreamAdmission.stats().response_bytes == baseline end)
+    end
+  end
+
+  test "batch workers retain authoritative errors until the batch caller consumes them", c do
+    baseline = UpstreamAdmission.stats().response_bytes
+    item = %{index: 0, deadline_us: System.monotonic_time(:microsecond) + 5_000_000}
+
+    result =
+      LassoWeb.RPCController.BatchExecutor.run([item], fn _, scope ->
+        RequestPipeline.execute_owned(scope, c.chain, "resolution_heap", [], %RequestOptions{
+          profile: c.profile,
+          strategy: :priority,
+          transport: :http,
+          provider_override: "primary",
+          failover_on_override: false,
+          timeout_ms: 5_000
+        })
+      end)
+
+    assert [{_, {:error, error, _}}] = result.items
+    assert UpstreamAdmission.stats().response_bytes > baseline
+    assert :ok = Response.Capacity.release(error, :batch_consumed)
+    await(fn -> UpstreamAdmission.stats().response_bytes == baseline end)
+  end
+
   defp assert_bounded(error) do
     assert byte_size(error.message) <= 1_000
     assert String.valid?(error.message)

@@ -643,7 +643,7 @@ defmodule Lasso.Config.ConfigStore do
   end
 
   @doc """
-  Updates an existing profile in ConfigStore with targeted ETS update.
+  Updates an existing profile through a validated config/catalog publication.
 
   Overwrites profile data, rebuilds indices for changed chains, and
   reconciles shared infrastructure (Catalog, InstanceSupervisors,
@@ -1229,15 +1229,13 @@ defmodule Lasso.Config.ConfigStore do
     publication = rebuild_shared_infrastructure(old_chain_ids, {:published, old_runtime})
     chains = sync_chain_supervisors(old_pairs)
 
-    transports =
-      Enum.map(specs, fn spec ->
-        result = reconcile_transport_channels(spec.profile_id, old_configs[spec.profile_id], spec)
-        if result == :ok, do: broadcast_profile_updated(spec.profile_id)
-        result
-      end)
+    Enum.each(specs, fn spec ->
+      reconcile_transport_channels(spec.profile_id, old_configs[spec.profile_id], spec)
+      broadcast_profile_updated(spec.profile_id)
+    end)
 
     notify_inject()
-    runtime_reconcile_status([publication | chains ++ transports])
+    runtime_reconcile_status([publication | chains])
   end
 
   defp catalog_coherent? do
@@ -2196,8 +2194,6 @@ defmodule Lasso.Config.ConfigStore do
       end
     end
   end
-
-  # Profile publication rebuilds all indices in the unpublished snapshot.
 
   defp notify_inject do
     case Application.get_env(:lasso, :profile_inject_listener) do

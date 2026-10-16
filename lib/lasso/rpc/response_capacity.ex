@@ -28,6 +28,51 @@ defmodule Lasso.RPC.Response.Capacity do
     end
   end
 
+  @doc "Delivers a retained result while its worker still owns the bytes."
+  @spec deliver(term(), pid(), reference(), tuple()) :: :ok
+  def deliver(result, recipient, ref, message) do
+    if lease(result) do
+      monitor = Process.monitor(recipient)
+      send(recipient, message)
+
+      receive do
+        {:response_capacity_received, ^ref} -> :ok
+        {:DOWN, ^monitor, :process, ^recipient, _} -> :ok
+      end
+
+      Process.demonitor(monitor, [:flush])
+    else
+      send(recipient, message)
+    end
+
+    :ok
+  end
+
+  @doc "Adopts delivered bytes before acknowledging the worker and serializing."
+  @spec accept(term(), pid(), reference()) :: term()
+  def accept(result, sender, ref) do
+    result =
+      case transfer(result, self()) do
+        :ok ->
+          result
+
+        {:error, _} ->
+          release(result, :handoff_failed)
+          {:error, :response_handoff_failed}
+      end
+
+    send(sender, {:response_capacity_received, ref})
+    result
+  end
+
+  @doc "Discards a delivery which no longer belongs to an active request."
+  @spec reject(term(), pid(), reference(), atom()) :: :ok
+  def reject(result, sender, ref, reason) do
+    release(result, reason)
+    send(sender, {:response_capacity_received, ref})
+    :ok
+  end
+
   @doc "Retain restored bytes and error data through downstream serialization and handoff."
   @spec retain(
           Response.Success.t() | JError.t(),

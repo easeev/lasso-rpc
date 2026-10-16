@@ -271,10 +271,10 @@ defmodule LassoWeb.RPCSocket do
       %{pid: ^owner_pid} = item ->
         Process.demonitor(item.monitor, [:flush])
         state = remove_forwarded_item(state, item_ref, item)
-        handle_forwarded_result(result, item, state)
+        handle_forwarded_result(Capacity.accept(result, owner_pid, item_ref), item, state)
 
       _missing_or_stale ->
-        Capacity.release(result, :stale_socket_result)
+        Capacity.reject(result, owner_pid, item_ref, :stale_socket_result)
         {:ok, count_item_owner(state, :stale_result)}
     end
   end

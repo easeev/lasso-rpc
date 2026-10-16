@@ -77,17 +77,7 @@ defmodule LassoWeb.RPCController.BatchExecutor do
       scope = ExecutionScope.monitored(self(), parent, item.deadline_us)
       result = executor.(item, scope)
 
-      result =
-        case Capacity.transfer(result, parent) do
-          :ok ->
-            result
-
-          {:error, _} ->
-            Capacity.release(result, :handoff_failed)
-            {:error, :response_handoff_failed}
-        end
-
-      send(parent, {:batch_item_result, item_ref, self(), result})
+      Capacity.deliver(result, parent, item_ref, {:batch_item_result, item_ref, self(), result})
     end
 
     case start_owner(state.supervisor, Lasso.Observability.Tracing.wrap(child)) do
@@ -127,6 +117,7 @@ defmodule LassoWeb.RPCController.BatchExecutor do
       {:batch_item_result, item_ref, pid, result} ->
         case state.active_by_ref do
           %{^item_ref => %{pid: ^pid} = active} ->
+            result = Capacity.accept(result, pid, item_ref)
             Process.demonitor(active.monitor, [:flush])
 
             state
@@ -137,7 +128,7 @@ defmodule LassoWeb.RPCController.BatchExecutor do
             |> await_items()
 
           _other ->
-            Capacity.release(result, :stale_batch_result)
+            Capacity.reject(result, pid, item_ref, :stale_batch_result)
 
             state
             |> update_counter(:stale_result)

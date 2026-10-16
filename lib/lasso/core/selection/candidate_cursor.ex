@@ -342,29 +342,18 @@ defmodule Lasso.RPC.Selection.CandidateCursor do
         cursor |> defer(:unsupported_deferred, tier, channel) |> scan()
 
       {:skip, reason} ->
-        case scan(cursor) do
-          {terminal, remaining} when terminal in [:done, :stale] ->
-            rejection = %{
-              provider_id: descriptor_provider_id(descriptor),
-              transport: descriptor_transport(descriptor),
-              reason: reason
-            }
+        rejection = %{
+          provider_id: descriptor_provider_id(descriptor),
+          transport: descriptor_transport(descriptor),
+          reason: reason
+        }
 
-            effect_context = remaining.effect_context
+        context =
+          cursor.effect_context
+          |> Map.update(:selection_rejections, [rejection], &Enum.take([rejection | &1], 32))
+          |> Map.update(:selection_rejection_count, 1, &(&1 + 1))
 
-            rejections =
-              Enum.take([rejection | Map.get(effect_context, :selection_rejections, [])], 32)
-
-            effect_context =
-              effect_context
-              |> Map.put(:selection_rejections, rejections)
-              |> Map.update(:selection_rejection_count, 1, &(&1 + 1))
-
-            {terminal, %{remaining | effect_context: effect_context}}
-
-          selected ->
-            selected
-        end
+        scan(%{cursor | effect_context: context})
     end
   end
 

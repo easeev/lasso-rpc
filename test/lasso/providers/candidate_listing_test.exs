@@ -346,7 +346,7 @@ defmodule Lasso.Providers.CandidateListingTest do
         :ets.lookup(:lasso_instance_state, {:routing_control_scope, @profile, @chain})
 
       assert unchanged.generation == active.generation
-      assert unchanged.publication_loss_generation == generation_two
+      assert unchanged.publication_loss_generation == nil
 
       continue_publication(ref, :after_catalog_populate)
       assert_publication_phase(ref, :after_control_populate, generation_two)
