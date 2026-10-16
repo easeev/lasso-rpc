@@ -9,50 +9,40 @@
 [![Telegram](https://img.shields.io/badge/telegram-join%20chat-26A5E4?style=flat-square&labelColor=19202E&logo=telegram&logoColor=white)](https://t.me/+79pFERTlZPIzZTZh)
 [![X](https://img.shields.io/badge/follow-%40lassoRPC-19202E?style=flat-square&labelColor=19202E&logo=x&logoColor=white)](https://x.com/lassoRPC)
 
-Lasso wrangles your nodes and RPC providers into one fast, resilient, observable
-JSON-RPC endpoint. It measures every upstream by method and transport, sends each
-request to the provider best able to serve it, and routes around outages, rate
-limits, and lagging nodes before your users notice. WebSocket subscriptions
-survive provider failures, and every routing decision is visible.
+Lasso puts one fast, resilient, observable JSON-RPC endpoint in front of your
+nodes and RPC providers. It measures every upstream by kind of request and
+transport, sends each call to the provider best able to serve it, and routes
+around outages, rate limits and lagging nodes before your users notice.
+WebSocket subscriptions survive provider failures, and every routing decision
+is visible.
 
 Point your client at a Lasso URL instead of a provider's. No SDK, no client
 library, no application changes.
 
-Self-hosted, Apache-2.0, and built on Elixir/OTP. The bundled public pool covers
-Ethereum, Base, and Arbitrum (mainnet and Sepolia) with no API keys, so you can
-try it in one command. Add any EVM chain and your own providers in YAML.
-
-[Quick Start](#quick-start) · [Use it from your app](#use-it-from-your-app) ·
-[Configuration](#configuration) · [Endpoints](#endpoints) ·
-[How it works](#how-it-works) · [Migration guide](docs/MIGRATION.md) ·
-[Documentation](#documentation) · [Support](SUPPORT.md)
-
-## Managed Lasso 
-
-[lasso.sh](https://lasso.sh) · [Setup with your agent](https://lasso.sh/llms.txt)
+Lasso is self-hosted, Apache-2.0 and built on Elixir/OTP. The bundled public
+pool covers Ethereum, Base and Arbitrum (mainnet and Sepolia) with no API keys,
+so you can try it in one command. Add any EVM chain and your own providers in
+YAML. Prefer a hosted endpoint? [Lasso Cloud](https://lasso.sh) runs this
+engine for you, and an agent can [set it up](https://lasso.sh/llms.txt) in one
+request.
 
 ## Why Lasso
 
 Every RPC provider is a bundle of tradeoffs: latency, uptime, rate limits,
-archive depth, method support, and cost. Those tradeoffs shift by region, method,
-and hour, and "compatible" JSON-RPC APIs disagree in the details. A single URL in
-an environment variable makes all of that your application's problem.
-
-Lasso makes it the RPC layer's problem. Different providers excel at different
-work: hot reads, archival queries, log scans, subscriptions. Lasso measures that
-live and routes each request accordingly. You get redundancy without rewrites,
-and you scale by adding providers instead of replatforming.
-
-## What Lasso handles
+archive depth, method support and cost. Those tradeoffs shift by region,
+method and hour, and "compatible" JSON-RPC APIs disagree in the details. A
+single URL in an environment variable makes all of that your application's
+problem. Lasso makes it the RPC layer's problem:
 
 - **Outages and rate limits.** Circuit breakers pull a failing provider from
-  rotation and reads fail over to the next healthy one. Recovered providers are
-  eased back in.
+  rotation, and reads fail over to the next healthy one. Recovered providers
+  are eased back in.
 - **Uneven performance.** A provider can be fast for `eth_call` and slow for
-  `eth_getLogs`. Lasso tracks latency per provider, method, and transport, and
-  `fastest` sends each call to the quickest provider for that method.
+  `eth_getLogs`. Lasso tracks latency per provider, kind of request and
+  transport, and `fastest` sends each call to the quickest provider for it.
 - **Mixed fleets.** Declare which providers are pruned, cap log ranges, or skip
-  `debug` and `trace`, and Lasso routes each request only where it can be served.
+  `debug` and `trace`, and Lasso routes each request only where it can be
+  served.
 - **Dropped WebSockets.** Matching `newHeads` and `logs` subscriptions share one
   upstream. When it fails, Lasso moves to another provider and backfills missed
   blocks and logs over HTTP.
@@ -60,7 +50,7 @@ and you scale by adding providers instead of replatforming.
   [block regression protection](docs/BLOCK_CONTINUITY.md), successive
   latest-block responses never regress, even as providers change.
 - **Knowing what happened.** Add `?include_meta=body` to see the provider,
-  strategy, latency, and retries behind any response, or watch routing live in
+  strategy, latency and retries behind any response, or watch routing live in
   the dashboard.
 
 Profiles give each app or environment its own providers, chains, and routing
@@ -69,15 +59,15 @@ measurements; optional clustering brings every region into one dashboard.
 
 ### Why not client-side fallback?
 
-Fallback in your client runs separately in every service and process you deploy.
-Each keeps its own picture of provider health, changing providers means a
-redeploy, and nothing records which upstream answered. Lasso moves that into one
-endpoint: shared measurements, one place to change providers, and a record of
-every routing decision.
+Client-side fallback runs separately in every service you deploy. Each keeps
+its own picture of provider health, changing providers means a redeploy, and
+nothing records which upstream answered. Lasso moves that into one endpoint:
+shared measurements, one place to change providers, and a record of every
+routing decision.
 
 ![Lasso dashboard showing chain topology, provider health, live routing activity, and the request tester](docs/images/dashboard.png)
 
-## Quick Start
+## Quick start
 
 You need Docker with the Compose plugin, curl, and OpenSSL. Start in an empty directory:
 
@@ -208,22 +198,19 @@ instead of starting with a broken provider. Declare
 [capabilities](docs/CONFIGURATION.md#provider-capabilities) such as unsupported
 methods, log-range limits, and pruning depth so Lasso routes around them. From a
 source checkout, `mix lasso.probe <provider_url>` tests a provider's method
-support, limits, and WebSocket subscriptions and recommends capability settings.
-It reports `eth_sendRawTransaction` and `eth_sendTransaction` as unverifiable:
-an invalid payload cannot prove support, and discovery never submits a real
-transaction. Test transaction behavior with your own controlled workload.
+support, limits and WebSocket subscriptions and recommends capability settings.
 
-Recreate the container after adding a profile:
+Validate and load new profiles and YAML edits without a restart:
 
 ```bash
-docker compose up -d --force-recreate --wait
+docker compose exec -T lasso /app/bin/lasso check-config
+docker compose exec -T lasso /app/bin/lasso reload
 ```
 
 Then use `http://localhost:4000/rpc/profile/my-app/ethereum` or
-`ws://localhost:4000/ws/rpc/profile/my-app/ethereum`. Later YAML edits apply
-with a [configuration reload](docs/DEPLOYMENT.md#custom-profiles-and-credentials);
-a failed reload keeps the active configuration. Environment or mount changes
-need a container recreate.
+`ws://localhost:4000/ws/rpc/profile/my-app/ethereum`. A rejected reload keeps
+the active configuration. Environment or mount changes need
+`docker compose up -d --force-recreate --wait`.
 
 Profiles separate routing configuration; they are not access controls. Profile
 `rps_limit` applies to the dashboard tester, not incoming RPC traffic.
@@ -231,48 +218,18 @@ Profiles separate routing configuration; they are not access controls. Profile
 ### Head tracking and provider quota
 
 Lasso tracks every provider's block height so it can tell when one falls
-behind. That tracking runs on every node and spends provider quota beside your
-own traffic. With no `block_time_ms` or cadence overrides, each distinct
-upstream costs:
+behind, and that background work spends provider quota on every node: a
+`newHeads` subscription where the provider has a `ws_url`, plus periodic
+`eth_blockNumber` and `eth_chainId` probes. For providers that bill per
+request, set `background_observations: false`; they keep serving, and Lasso
+learns their height from the head reads routed to them. Set `block_time_ms` on
+chains faster than 12-second blocks. The
+[configuration reference](docs/CONFIGURATION.md#monitoring) lists the intervals,
+per-provider overrides and lag filtering.
 
-| Background request | Rate per upstream, per node |
-|--------------------|-----------------------------|
-| `newHeads` notification, when the provider has a `ws_url` | One per block |
-| `eth_blockNumber` | One per 12 s, or one per 36 s while its feed is current |
-| `eth_chainId` | One per 12 s |
-
-Successful routed `eth_blockNumber` and `eth_getBlockByNumber("latest")`
-responses also provide head evidence for the provider that served them. A chain
-needs one head feed, and any provider with a free WebSocket can carry it. Turn
-background tracking off for providers that bill per request:
-
-```yaml
-providers:
-  - id: own-node
-    url: http://10.0.0.5:8545
-    ws_url: ws://10.0.0.5:8546
-  - id: metered
-    url: https://rpc.example.com/${METERED_KEY}
-    background_observations: false
-```
-
-A provider with `background_observations: false` keeps serving requests and
-subscriptions, and Lasso learns its height from the head reads routed to it.
-Profiles sharing the same upstream share its background work; another enabled
-reference can keep that work running. The
-[configuration reference](docs/CONFIGURATION.md#monitoring) lists the intervals
-and per-provider overrides.
-
-Current limits:
-
-- Lag filtering needs `selection.max_lag_blocks` and a reference head that a
-  majority of at least two providers agree on.
-- Head comparison assumes 12-second blocks unless `block_time_ms` is set, so
-  set it on faster chains.
-- Methods Lasso does not recognize, such as vendor extensions, get one attempt
-  on whichever provider the strategy picks. List them in `unsupported_methods`
-  on providers that lack them, or send them to
-  `/rpc/provider/:provider_id/:chain`.
+Methods Lasso doesn't recognize, such as vendor extensions, get one attempt on
+whichever provider the strategy picks. List them in `unsupported_methods` on
+providers that lack them, or send them to `/rpc/provider/:provider_id/:chain`.
 
 ## Endpoints
 
@@ -311,7 +268,7 @@ docker compose logs --tail=100 lasso
 | Container fails to start | Look for missing environment variables or invalid YAML in the logs. Keep `public.yml`; profile filenames must match their slugs. |
 | Port 4000 is in use | Set `LASSO_PORT=4001` in `.env`, run `docker compose up -d --wait`, and use port 4001. |
 | Health passes but RPC fails | Health covers Lasso itself, not upstreams. Check provider status in the dashboard, credentials, and network access. |
-| Profile changes have no effect | Reload existing profiles on each node. After adding a profile or changing `.env` or mounts, run `docker compose up -d --force-recreate --wait`. |
+| Profile changes have no effect | Run `bin/lasso reload` on each node. After changing `.env` or mounts, run `docker compose up -d --force-recreate --wait`. |
 
 ## Run from source
 
@@ -348,25 +305,12 @@ across regions without touching the routing hot path.
 
 ### Why Elixir/OTP
 
-RPC routing is a concurrency and failure-handling problem, which is exactly what
-the BEAM was built for.
-
-- **Massive concurrency:** lightweight processes model every request, provider
-  connection, and subscription without shared-memory complexity.
-- **Fault isolation:** OTP supervision contains failures and restarts components
-  fast, which matters when upstreams are flaky or rate-limited.
-- **Fast shared state:** ETS serves routing, benchmark, and breaker state on the
-  hot path without a central bottleneck.
-- **Distributed by design:** clustering and remote messaging are built into the
-  runtime.
-
-## Direction
-
-Lasso's routing is built to learn. Provider behavior such as limits, history
-depth, and method support should be discovered from probes and live traffic,
-attributed to evidence, and shown to operators instead of hand-written into
-config. Observations stay typed, so provider comparison can grow from head
-height to fork-aware checks on headers, logs, and responses.
+RPC routing is a concurrency and failure-handling problem, which is what the
+BEAM was built for. Lightweight processes model every request, provider
+connection and subscription; OTP supervision contains and restarts failures
+when upstreams are flaky; ETS serves routing, benchmark and breaker state on
+the hot path without a central bottleneck; and clustering is built into the
+runtime.
 
 ## Documentation
 
@@ -380,9 +324,8 @@ height to fork-aware checks on headers, logs, and responses.
 - [RPC standards](docs/RPC_STANDARDS.md): method support and execution semantics
 - [Testing](docs/TESTING.md) and [Changelog](CHANGELOG.md)
 
-Prefer a managed deployment? [Lasso Cloud](https://lasso.sh) runs this engine
-with hosted providers, API keys, and usage analytics. See the
-[Cloud docs](https://docs.lasso.sh/cloud/adoption).
+The full documentation, for Core and the hosted [Lasso Cloud](https://lasso.sh),
+is at [docs.lasso.sh](https://docs.lasso.sh).
 
 ## Contributing
 
