@@ -50,6 +50,8 @@ or subscription keys.
 | `lasso_rpc_route_duration_seconds_total` | Summed completion time of the same requests; divide by requests for the mean | profile, chain, origin |
 | `lasso_rpc_route_detail_sampled_out_total` | Successes excluded from detail telemetry by the sampling budget | profile, chain, origin |
 | `lasso_rpc_requests_total` | Sampled routed completion count by provider and method | chain, provider, method, outcome |
+| `lasso_rpc_diagnostic_outcomes_total` | Request-terminal diagnostic outcomes; successful detail is sampled, so this is not a route total or success ratio | result, exhaustion_cause |
+| `lasso_routing_selection_exhausted_total` | Profile-selection phases exhausted before upstream dispatch | reason, profile, chain, fallback |
 | `lasso_rpc_request_duration_seconds` | Final routed latency, including attempts/failover | profile, chain, provider, method, transport, origin, outcome |
 | `lasso_upstream_attempts_total` | Non-success dispatched attempt diagnostics only | profile, chain, provider, transport, origin, outcome, category |
 | `lasso_rpc_failovers_total` | Sum of failovers recorded at final completion | route labels without outcome |
