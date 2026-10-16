@@ -253,6 +253,8 @@ transports within a tier. It does not guarantee exact shares, capacity-aware
 balancing, or independent operators. See [Routing](ROUTING.md#load-balanced-default)
 for the dispatch-budget and recovered-head-preference boundaries.
 
+For upgrades from v0.5.1, rename `LW_BETA` to `BALANCED_FAST_BETA` (application key `:balanced_fast_beta`); the old variable is no longer read. Existing `latency-weighted` URLs and `strategy` values remain permanent aliases.
+
 **Balanced Fast** — Weighted random ordering of qualified upstreams using scale-free latency ratios. It sits between load-balanced and fastest: load stays spread while the quickest providers receive more of it. Reliability qualification, capacity policy, and exploration remain separate concerns. `latency-weighted` is an alias.
 
 ### Health-Based Tiering
